@@ -24,6 +24,7 @@
 
 /* USER CODE END Includes */
 extern DMA_HandleTypeDef hdma_dac1_ch2;
+extern DMA_HandleTypeDef hdma_adc1;
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -75,6 +76,56 @@ void HAL_MspInit(void)
   /* USER CODE BEGIN MspInit 1 */
 
   /* USER CODE END MspInit 1 */
+}
+
+/**
+  * @brief ADC MSP Initialization
+  * @param hadc ADC handle pointer
+  */
+void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if (hadc->Instance == ADC1)
+  {
+    __HAL_RCC_ADC12_CLK_ENABLE();
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+
+    /* Zio/Arduino A5: PF11 -> ADC1_INP2 */
+    GPIO_InitStruct.Pin = GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+    hdma_adc1.Instance = DMA1_Stream1;
+    hdma_adc1.Init.Request = DMA_REQUEST_ADC1;
+    hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+    hdma_adc1.Init.Mode = DMA_NORMAL;
+    hdma_adc1.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_adc1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_adc1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_LINKDMA(hadc, DMA_Handle, hdma_adc1);
+
+    HAL_NVIC_SetPriority(ADC_IRQn, 1, 1);
+    HAL_NVIC_EnableIRQ(ADC_IRQn);
+  }
+}
+
+void HAL_ADC_MspDeInit(ADC_HandleTypeDef* hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    __HAL_RCC_ADC12_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOF, GPIO_PIN_11);
+    HAL_DMA_DeInit(hadc->DMA_Handle);
+    HAL_NVIC_DisableIRQ(ADC_IRQn);
+  }
 }
 
 /**
@@ -413,7 +464,11 @@ void HAL_TIM_Encoder_MspInit(TIM_HandleTypeDef* htim_encoder)
   */
 void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
 {
-  if(htim_base->Instance==TIM6)
+  if(htim_base->Instance==TIM2)
+  {
+    __HAL_RCC_TIM2_CLK_ENABLE();
+  }
+  else if(htim_base->Instance==TIM6)
   {
     /* USER CODE BEGIN TIM6_MspInit 0 */
 
@@ -465,7 +520,11 @@ void HAL_TIM_Encoder_MspDeInit(TIM_HandleTypeDef* htim_encoder)
   */
 void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
 {
-  if(htim_base->Instance==TIM6)
+  if(htim_base->Instance==TIM2)
+  {
+    __HAL_RCC_TIM2_CLK_DISABLE();
+  }
+  else if(htim_base->Instance==TIM6)
   {
     /* USER CODE BEGIN TIM6_MspDeInit 0 */
 
@@ -520,7 +579,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     /* USART1 interrupt Init */
-    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
     /* USER CODE BEGIN USART1_MspInit 1 */
 

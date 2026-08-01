@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.22)
 
+if(DEFINED CMAKE_TOOLCHAIN_FILE)
+    message(STATUS "Toolchain file: ${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
 #
 # This file is generated only once,
 # and is not re-generated if converter is called multiple times.
@@ -71,6 +75,12 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined libraries
 )
 
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.hex
+    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${CMAKE_PROJECT_NAME}> ${CMAKE_PROJECT_NAME}.bin
+    COMMENT "Generating CM4 HEX and BIN images"
+)
+
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
@@ -78,8 +88,6 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 if((CMAKE_C_STANDARD EQUAL 90) OR (CMAKE_C_STANDARD EQUAL 99))
     message(ERROR "Generated code requires C11 or higher")
 endif()
-
-
 
 
 

@@ -28,6 +28,7 @@
 #include <string.h>
 #include "graph.h"
 #include "generate.h"
+#include "oscilloscope.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,6 +60,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac1_ch2;
 
@@ -66,6 +70,7 @@ LTDC_HandleTypeDef hltdc;
 
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart1;
 
@@ -78,7 +83,9 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_LTDC_Init(void);
+static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_DAC1_Init(void);
@@ -107,7 +114,7 @@ void UART_SendToF103(const char *format, ...) {
     char tx_buf[64];
     va_list args;
     va_start(args, format);
-    vsprintf(tx_buf, format, args);
+    vsnprintf(tx_buf, sizeof(tx_buf), format, args);
     va_end(args);
     HAL_UART_Transmit(&huart1, (uint8_t*)tx_buf, strlen(tx_buf), 100);
 }
@@ -125,18 +132,19 @@ void Process_Touch_Interaction(uint16_t x, uint16_t y) {
     is_pinching = 0;
     uint8_t old_state = current_sys_state;
     uint8_t old_sel   = main_menu_sel;
-    uint8_t old_wave  = current_wave;
     uint8_t old_ctrl  = current_ctrl;
     uint8_t old_wg_w  = wg_wave;
     uint8_t old_wg_c  = wg_ctrl;
 
     if (current_sys_state != SYS_MAIN_MENU && x > 700 && y < 60) {
+        if (current_sys_state == SYS_OSC) Oscilloscope_Stop();
         current_sys_state = SYS_MAIN_MENU;
     }
     else if (current_sys_state == SYS_MAIN_MENU) {
         if (x > 130 && x < 370 && y > 120 && y < 360) {
             main_menu_sel = 0;
             current_sys_state = SYS_OSC;
+            Oscilloscope_Start();
         }
         else if (x > 430 && x < 670 && y > 120 && y < 360) {
             main_menu_sel = 1;
@@ -145,40 +153,48 @@ void Process_Touch_Interaction(uint16_t x, uint16_t y) {
         }
     }
     else if (current_sys_state == SYS_OSC) {
-        if (x > 700) {
-            if (y > 40 && y < 90)       current_wave = WAVE_SINE;
-            else if (y > 90 && y < 140) current_wave = WAVE_SQUARE;
-            else if (y > 140 && y < 190)current_wave = WAVE_TRIANGLE;
-        }
-        else if (x < 100) {
-            if (y > 40 && y < 90)       current_ctrl = CTRL_FREQ;
-            else if (y > 90 && y < 140) current_ctrl = CTRL_PHASE;
-            else if (y > 140 && y < 190)current_ctrl = CTRL_AMPLITUDE;
-            else if (y > 190 && y < 240)current_ctrl = CTRL_OFFSET_Y;
+        if (x > 700U) {
+            const OscilloscopeState *osc = Oscilloscope_GetState();
+            if (y > 60U && y < 115U) {
+                Oscilloscope_ToggleRun();
+                global_needs_redraw = 1U;
+            } else if (y >= 115U && y < 170U) {
+                Oscilloscope_SetTriggerSlope(
+                    osc->trigger_slope == OSC_TRIGGER_RISING ?
+                    OSC_TRIGGER_FALLING : OSC_TRIGGER_RISING);
+                global_needs_redraw = 1U;
+            } else if (y >= 170U && y < 225U) {
+                Oscilloscope_Single();
+                global_needs_redraw = 1U;
+            }
+        } else if (x < 100U) {
+            if (y > 60U && y < 115U) current_ctrl = CTRL_TIMEBASE;
+            else if (y < 170U)       current_ctrl = CTRL_VOLTS_DIV;
+            else if (y < 225U)       current_ctrl = CTRL_TRIGGER_LEVEL;
+            else if (y < 280U)       current_ctrl = CTRL_VERTICAL_POS;
         }
     }
     else if (current_sys_state == SYS_GEN) {
         if (x < 100) {
-            if (y > 40 && y < 90)       wg_wave = WAVE_SINE;
-            else if (y > 90 && y < 140) wg_wave = WAVE_SQUARE;
-            else if (y > 140 && y < 190)wg_wave = WAVE_TRIANGLE;
+            if (y > 60 && y < 115)       wg_wave = WAVE_SINE;
+            else if (y < 165)            wg_wave = WAVE_SQUARE;
+            else if (y < 215)            wg_wave = WAVE_TRIANGLE;
 
             // 💥 如果波形种类被触摸改变了，立刻同步给底层 DAC
             if (old_wg_w != wg_wave) {
                 Sync_Hardware_WaveGen();
             }
         }
-        else if (x > 280 && x < 720 && y > 80 && y < 220) {
+        else if (x > 180 && x < 680 && y > 90 && y < 210) {
             wg_ctrl = 0;
         }
-        else if (x > 280 && x < 720 && y > 230 && y < 370) {
+        else if (x > 180 && x < 680 && y > 260 && y < 380) {
             wg_ctrl = 1;
         }
     }
 
     if (old_state != current_sys_state ||
         old_sel   != main_menu_sel   ||
-        old_wave  != current_wave    ||
         old_ctrl  != current_ctrl    ||
         old_wg_w  != wg_wave         ||
         old_wg_c  != wg_ctrl) {
@@ -224,24 +240,18 @@ void Process_Pinch_Gesture(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
 
     if (abs(diff_x) > abs(diff_y) && abs(diff_x) > 2) {
         // 阈值设为 2 防止手抖抖动
-        // 动作：水平双指滑动 -> 调节 current_omega (相当于调节 X 轴缩放)
+        // 水平捏合：切换采样时基。
 
         // 双指拉开 (diff_x > 0)，频率降低/波形拉宽；捏合则反之。
         // 你可以根据视觉习惯修改前面的正负号
-        current_omega -= (float)diff_x * 0.0005f;
-
-        if(current_omega < 0.005f) current_omega = 0.005f;
-        if(current_omega > 0.5f) current_omega = 0.5f;
+        Oscilloscope_AdjustTimebase(diff_x > 0 ? 1 : -1);
         state_changed = 1;
     }
     else if (abs(diff_y) > abs(diff_x) && abs(diff_y) > 2) {
-        // 动作：垂直双指滑动 -> 调节 current_amplitude (相当于调节 Y 轴缩放)
+        // 垂直捏合：切换垂直 V/div 档位。
 
         // 双指拉开 (diff_y > 0)，幅值变大；捏合变小
-        current_amplitude += (float)diff_y * 0.5f;
-
-        if(current_amplitude < 1.0f) current_amplitude = 1.0f;
-        if(current_amplitude > 480.0f) current_amplitude = 480.0f;
+        Oscilloscope_AdjustVoltsPerDiv(diff_y > 0 ? -1 : 1);
         state_changed = 1;
     }
 
@@ -321,7 +331,9 @@ Error_Handler();
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
+  MX_ADC1_Init();
   MX_LTDC_Init();
+  MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_DAC1_Init();
@@ -331,8 +343,8 @@ Error_Handler();
     UART_SendToF103("I:\n");
 
     // 💥 启动底层波形发生器，并刷入第一次默认参数
-    DAC_WaveGen_Init();
     Sync_Hardware_WaveGen();
+    DAC_WaveGen_Init();
 
     // 1. 配置示波器专用调色板 (加入 3 号蓝色用于菜单高亮)
     my_palette[0] = 0xFF000000; // 0号: 纯黑 (背景)
@@ -352,10 +364,13 @@ Error_Handler();
     // 2. 启动编码器硬件解码！(TIM3)
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
+    if (Oscilloscope_Init() != HAL_OK) {
+        Error_Handler();
+    }
+
     // 3. 画出第一帧初始画面
     // (注意：这里调用的已经是全面升级后的无参数渲染函数)
-    Draw_Oscilloscope_UI();
-    Draw_Waveform();
+    Draw_Main_Menu();
 
     // 4. 将第一帧画面推入物理显存
     if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
@@ -374,6 +389,7 @@ Error_Handler();
   int16_t last_encoder_cnt = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
 
   // 刷出主菜单第一帧
+  Oscilloscope_Stop();
   Play_Cyber_Boot_Sequence();
   Draw_Main_Menu();
   if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) SCB_CleanDCache_by_Addr((uint32_t*)0x24020000, 800 * 480);
@@ -405,10 +421,7 @@ Error_Handler();
 
               // 💥 执行重置波形参数逻辑！
               if (current_sys_state == SYS_OSC) {
-                  current_omega = 0.05f;
-                  current_phase = 0.0f;
-                  current_amplitude = 100.0f;
-                  current_offset_y = 240;
+                  Oscilloscope_ResetControls();
                   global_needs_redraw = 1;
               }
               else if (current_sys_state == SYS_GEN) {
@@ -455,11 +468,12 @@ Error_Handler();
           if (!is_button_pressing) {
               if (current_sys_state == SYS_OSC) {
                   UART_SendToF103("I:\n"); // 打断 F103 跑马灯
+                  int16_t step = diff > 0 ? 1 : -1;
                   switch (current_ctrl) {
-                      case CTRL_FREQ: current_omega += (float)diff * 0.002f; if(current_omega < 0.005f) current_omega = 0.005f; if(current_omega > 0.5f) current_omega = 0.5f; break;
-                      case CTRL_PHASE: current_phase += (float)diff * 0.2f; break;
-                      case CTRL_AMPLITUDE: current_amplitude += (float)diff * 5.0f; if(current_amplitude < 1.0f) current_amplitude = 1.0f; if(current_amplitude > 480.0f) current_amplitude = 480.0f; break;
-                      case CTRL_OFFSET_Y: current_offset_y -= diff * 5; if(current_offset_y < 20) current_offset_y = 20; if(current_offset_y > 460) current_offset_y = 460; break;
+                      case CTRL_TIMEBASE:      Oscilloscope_AdjustTimebase(step); break;
+                      case CTRL_VOLTS_DIV:     Oscilloscope_AdjustVoltsPerDiv(step); break;
+                      case CTRL_TRIGGER_LEVEL: Oscilloscope_AdjustTrigger(-step); break;
+                      case CTRL_VERTICAL_POS:  Oscilloscope_AdjustVerticalPosition(-step); break;
                   }
                   global_needs_redraw = 1;
               }
@@ -503,6 +517,13 @@ Error_Handler();
       // =========================================================
       // 统一渲染调度 (被触摸、手势或编码器触发)
       // =========================================================
+      static uint32_t last_scope_render = 0U;
+      if (Oscilloscope_Poll() && current_sys_state == SYS_OSC &&
+          (HAL_GetTick() - last_scope_render >= 33U)) {
+          last_scope_render = HAL_GetTick();
+          global_needs_redraw = 1U;
+      }
+
       if (global_needs_redraw) {
           global_needs_redraw = 0; // 清除标志
 
@@ -586,6 +607,47 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function (oscilloscope input on PF11/A5)
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T2_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_ONESHOT;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_8CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  sConfig.OffsetSignedSaturation = DISABLE;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -694,6 +756,32 @@ static void MX_LTDC_Init(void)
 
   /* USER CODE END LTDC_Init 2 */
 
+}
+
+/**
+  * @brief TIM2 Initialization Function (ADC sample clock)
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 239;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
@@ -844,6 +932,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
 
 }
 
@@ -900,6 +991,16 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    Oscilloscope_OnConversionComplete(hadc);
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    Oscilloscope_OnError(hadc);
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
         if (h7_rx_byte == '\n') {

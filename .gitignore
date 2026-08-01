@@ -1,0 +1,15 @@
+/build/
+/CM4/build/
+/CM7/build/
+/coprocessor/**/build/
+/coprocessor/**/Debug/
+/.idea/vcs.xml
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo

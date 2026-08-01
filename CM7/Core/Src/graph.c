@@ -1,423 +1,359 @@
-// graph.c
-#include <stdlib.h>
-#include <math.h>
-#include "main.h"
 #include "graph.h"
+#include "oscilloscope.h"
 
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-// 增加 M_PI 的防御性定义，防止 GCC 报错
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+#define FB_ADDR      0x24020000U
+#define SCREEN_W     800
+#define SCREEN_H     480
+#define PLOT_X       100
+#define PLOT_Y        60
+#define PLOT_W       600
+#define PLOT_H       360
+#define COLOR_BG       0U
+#define COLOR_RED      1U
+#define COLOR_GREEN    2U
+#define COLOR_BLUE     3U
+#define COLOR_WHITE    4U
+#define COLOR_YELLOW   5U
+#define COLOR_GRID     6U
+#define COLOR_CYAN     7U
 
-// 1. 全局变量定义和初始化
-SystemState current_sys_state = SYS_MAIN_MENU;
-uint8_t main_menu_sel = 0;
+volatile SystemState current_sys_state = SYS_MAIN_MENU;
+volatile uint8_t main_menu_sel = 0U;
+volatile ControlMode current_ctrl = CTRL_TIMEBASE;
 
-WaveType current_wave = WAVE_SINE;
-ControlMode current_ctrl = CTRL_FREQ;
+float wg_freq = 1000.0f;
+float wg_amp = 3.3f;
+volatile uint8_t wg_ctrl = 0U;
+volatile WaveType wg_wave = WAVE_SINE;
+uint32_t my_palette[256] = {0U};
 
-float current_omega     = 0.05f;
-float current_phase     = 0.0f;
-float current_amplitude = 100.0f;
-int   current_offset_y  = 240;
+static uint8_t *framebuffer(void)
+{
+    return (uint8_t *)FB_ADDR;
+}
 
-float wg_freq = 1000.0f; // 默认 1kHz
-float wg_amp  = 3.3f;    // 默认 3.3V
-uint8_t wg_ctrl = 0;
-WaveType wg_wave = WAVE_SINE;
-uint32_t my_palette[256] = {0};
+static void clear_screen(void)
+{
+    memset(framebuffer(), COLOR_BG, SCREEN_W * SCREEN_H);
+}
 
-// ==========================================================
-// 内部函数声明区 (用 static 隐藏这些专用于 graph.c 内部的函数)
-// ==========================================================
-static void Icon_Sine(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_Square(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_Triangle(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_Freq(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_Phase(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_Amp(uint16_t x, uint16_t y, uint8_t c);
-static void Icon_OffsetY(uint16_t x, uint16_t y, uint8_t c);
+static void draw_rect(int x, int y, int w, int h, uint8_t color)
+{
+    Draw_Line_L8(x, y, x + w, y, color);
+    Draw_Line_L8(x, y + h, x + w, y + h, color);
+    Draw_Line_L8(x, y, x, y + h, color);
+    Draw_Line_L8(x + w, y, x + w, y + h, color);
+}
 
-// ==========================================================
-// 绘图引擎核心代码
-// ==========================================================
+static void fill_rect(int x, int y, int w, int h, uint8_t color)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > SCREEN_W) w = SCREEN_W - x;
+    if (y + h > SCREEN_H) h = SCREEN_H - y;
+    if (w <= 0 || h <= 0) return;
+    for (int row = 0; row < h; ++row) {
+        memset(framebuffer() + (y + row) * SCREEN_W + x, color, (size_t)w);
+    }
+}
 
-void Draw_Line_L8(int x1, int y1, int x2, int y2, uint8_t color_index) {
-    uint8_t *fb = (uint8_t *)0x24020000;
-    int dx = abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
-    int dy = abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
-    int err = (dx > dy ? dx : -dy) / 2, e2;
+/* Compact 5x7 font. Each byte is one vertical column, least-significant bit
+ * at the top. Unsupported characters are rendered as a space. */
+static const uint8_t *glyph(char ch)
+{
+    static const uint8_t blank[5] = {0, 0, 0, 0, 0};
+    static const uint8_t digits[10][5] = {
+        {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00},
+        {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4B,0x31},
+        {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
+        {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+        {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}
+    };
+    static const uint8_t letters[26][5] = {
+        {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36},
+        {0x3E,0x41,0x41,0x41,0x22}, {0x7F,0x41,0x41,0x22,0x1C},
+        {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
+        {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F},
+        {0x00,0x41,0x7F,0x41,0x00}, {0x20,0x40,0x41,0x3F,0x01},
+        {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
+        {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F},
+        {0x3E,0x41,0x41,0x41,0x3E}, {0x7F,0x09,0x09,0x09,0x06},
+        {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
+        {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01},
+        {0x3F,0x40,0x40,0x40,0x3F}, {0x1F,0x20,0x40,0x20,0x1F},
+        {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63},
+        {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}
+    };
+    static const uint8_t dot[5]   = {0x00,0x60,0x60,0x00,0x00};
+    static const uint8_t colon[5] = {0x00,0x36,0x36,0x00,0x00};
+    static const uint8_t slash[5] = {0x20,0x10,0x08,0x04,0x02};
+    static const uint8_t dash[5]  = {0x08,0x08,0x08,0x08,0x08};
+    static const uint8_t up[5]    = {0x08,0x04,0x02,0x04,0x08};
+    static const uint8_t down[5]  = {0x08,0x10,0x20,0x10,0x08};
+
+    if (ch >= '0' && ch <= '9') return digits[ch - '0'];
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    if (ch >= 'A' && ch <= 'Z') return letters[ch - 'A'];
+    if (ch == '.') return dot;
+    if (ch == ':') return colon;
+    if (ch == '/') return slash;
+    if (ch == '-') return dash;
+    if (ch == '^') return up;
+    if (ch == 'v') return down;
+    return blank;
+}
+
+static void draw_char(int x, int y, char ch, uint8_t color, uint8_t scale)
+{
+    const uint8_t *bitmap = glyph(ch);
+    for (int col = 0; col < 5; ++col) {
+        for (int row = 0; row < 7; ++row) {
+            if ((bitmap[col] & (1U << row)) != 0U) {
+                fill_rect(x + col * scale, y + row * scale,
+                          scale, scale, color);
+            }
+        }
+    }
+}
+
+static void draw_text(int x, int y, const char *text, uint8_t color, uint8_t scale)
+{
+    while (*text != '\0') {
+        draw_char(x, y, *text++, color, scale);
+        x += 6 * scale;
+    }
+}
+
+static void draw_button(int x, int y, int w, int h, const char *label,
+                        bool selected, uint8_t selected_color)
+{
+    const uint8_t color = selected ? selected_color : COLOR_WHITE;
+    if (selected) fill_rect(x + 2, y + 2, w - 3, h - 3, COLOR_GRID);
+    draw_rect(x, y, w, h, color);
+    int label_width = (int)strlen(label) * 12 - 2;
+    draw_text(x + (w - label_width) / 2, y + (h - 14) / 2,
+              label, color, 2U);
+}
+
+static void format_fixed(char *out, size_t out_size, float value,
+                         uint8_t decimals)
+{
+    uint32_t multiplier = decimals == 2U ? 100U : 10U;
+    if (value < 0.0f) value = 0.0f;
+    uint32_t scaled = (uint32_t)(value * (float)multiplier + 0.5f);
+    if (decimals == 2U) {
+        (void)snprintf(out, out_size, "%lu.%02lu",
+                       (unsigned long)(scaled / 100U),
+                       (unsigned long)(scaled % 100U));
+    } else {
+        (void)snprintf(out, out_size, "%lu.%01lu",
+                       (unsigned long)(scaled / 10U),
+                       (unsigned long)(scaled % 10U));
+    }
+}
+
+void Draw_Line_L8(int x1, int y1, int x2, int y2, uint8_t color)
+{
+    int dx = abs(x2 - x1);
+    int sx = x1 < x2 ? 1 : -1;
+    int dy = -abs(y2 - y1);
+    int sy = y1 < y2 ? 1 : -1;
+    int error = dx + dy;
 
     for (;;) {
-        if (x1 >= 0 && x1 < 800 && y1 >= 0 && y1 < 480) fb[y1 * 800 + x1] = color_index;
+        if (x1 >= 0 && x1 < SCREEN_W && y1 >= 0 && y1 < SCREEN_H) {
+            framebuffer()[y1 * SCREEN_W + x1] = color;
+        }
         if (x1 == x2 && y1 == y2) break;
-        e2 = err;
-        if (e2 > -dx) { err -= dy; x1 += sx; }
-        if (e2 <  dy) { err += dx; y1 += sy; }
+        int twice_error = 2 * error;
+        if (twice_error >= dy) { error += dy; x1 += sx; }
+        if (twice_error <= dx) { error += dx; y1 += sy; }
     }
 }
 
-
-void Draw_Grid_And_Axes(void) {
-    uint8_t *fb = (uint8_t *)0x24020000;
-    for(uint32_t i = 0; i < 800 * 480; i++) fb[i] = 0;
-    for(int y = 0; y < 480; y += 50) for(int x = 0; x < 800; x++) fb[y * 800 + x] = 6;
-    for(int x = 0; x < 800; x += 50) for(int y = 0; y < 480; y++) fb[y * 800 + x] = 6;
-    for(int x = 0; x < 800; x++) fb[240 * 800 + x] = 4;
-    for(int y = 0; y < 480; y++) fb[y * 800 + 400] = 4;
+void Draw_Grid_And_Axes(void)
+{
+    clear_screen();
+    for (int x = PLOT_X; x <= PLOT_X + PLOT_W; x += PLOT_W / 10) {
+        Draw_Line_L8(x, PLOT_Y, x, PLOT_Y + PLOT_H, COLOR_GRID);
+    }
+    for (int y = PLOT_Y; y <= PLOT_Y + PLOT_H; y += PLOT_H / 8) {
+        Draw_Line_L8(PLOT_X, y, PLOT_X + PLOT_W, y, COLOR_GRID);
+    }
+    draw_rect(PLOT_X, PLOT_Y, PLOT_W, PLOT_H, COLOR_WHITE);
 }
 
-void Draw_UI_Button(uint16_t x, uint16_t y, uint8_t is_selected, void (*DrawIcon)(uint16_t, uint16_t, uint8_t)) {
-    uint8_t color = is_selected ? 3 : 4;
-    Draw_Line_L8(x, y, x + 60, y, color);
-    Draw_Line_L8(x, y + 30, x + 60, y + 30, color);
-    Draw_Line_L8(x, y, x, y + 30, color);
-    Draw_Line_L8(x + 60, y, x + 60, y + 30, color);
-    if(DrawIcon) DrawIcon(x, y, color);
+void Draw_UI_Button(uint16_t x, uint16_t y, uint8_t selected,
+                    void (*DrawIcon)(uint16_t, uint16_t, uint8_t))
+{
+    const uint8_t color = selected ? COLOR_BLUE : COLOR_WHITE;
+    draw_rect(x, y, 60, 30, color);
+    if (DrawIcon != NULL) DrawIcon(x, y, color);
 }
 
-// --- 以下所有图标绘制函数都加上 static ---
-static void Icon_Sine(uint16_t x, uint16_t y, uint8_t c) {
-    for (int i=5; i<55; i++) Draw_Line_L8(x+i, y+15-(int)(10*sin((i-5)*0.15f)), x+i, y+15-(int)(10*sin((i-5)*0.15f)), c);
-}
-static void Icon_Square(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+10, y+23, x+30, y+23, c); Draw_Line_L8(x+30, y+23, x+30, y+7, c); Draw_Line_L8(x+30, y+7, x+50, y+7, c);
-}
-static void Icon_Triangle(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+10, y+23, x+30, y+7, c); Draw_Line_L8(x+30, y+7, x+50, y+23, c);
-}
-
-static void Icon_Freq(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+20, y+8, x+20, y+22, c); Draw_Line_L8(x+30, y+8, x+30, y+22, c); Draw_Line_L8(x+40, y+8, x+40, y+22, c);
-}
-static void Icon_Phase(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+10, y+15, x+50, y+15, c); Draw_Line_L8(x+10, y+15, x+15, y+10, c); Draw_Line_L8(x+50, y+15, x+45, y+20, c);
-}
-static void Icon_Amp(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+30, y+5, x+30, y+25, c); Draw_Line_L8(x+30, y+5, x+25, y+10, c); Draw_Line_L8(x+30, y+25, x+35, y+20, c);
-}
-static void Icon_OffsetY(uint16_t x, uint16_t y, uint8_t c) {
-    Draw_Line_L8(x+10, y+20, x+50, y+20, c); Draw_Line_L8(x+30, y+5, x+30, y+15, c); Draw_Line_L8(x+30, y+5, x+25, y+10, c);
-}
-
-// ----------------------------------------------------------
-
-void Draw_Oscilloscope_UI(void) {
+void Draw_Oscilloscope_UI(void)
+{
     Draw_Grid_And_Axes();
-    // 右侧菜单
-    Draw_UI_Button(720, 50,  (current_wave == WAVE_SINE), Icon_Sine);
-    Draw_UI_Button(720, 100, (current_wave == WAVE_SQUARE), Icon_Square);
-    Draw_UI_Button(720, 150, (current_wave == WAVE_TRIANGLE), Icon_Triangle);
-    // 左侧菜单
-    Draw_UI_Button(20, 50,  (current_ctrl == CTRL_FREQ), Icon_Freq);
-    Draw_UI_Button(20, 100, (current_ctrl == CTRL_PHASE), Icon_Phase);
-    Draw_UI_Button(20, 150, (current_ctrl == CTRL_AMPLITUDE), Icon_Amp);
-    Draw_UI_Button(20, 200, (current_ctrl == CTRL_OFFSET_Y), Icon_OffsetY);
-}
+    const OscilloscopeState *osc = Oscilloscope_GetState();
+    char text[40];
+    char value[16];
 
-void Draw_Waveform(void) {
-    int prev_x = 0;
-    int prev_y = current_offset_y;
+    draw_text(8, 8, "OSC", COLOR_GREEN, 2U);
+    draw_text(60, 8, "IN:A5 PF11", COLOR_CYAN, 2U);
 
-    for (int x = 0; x < 800; x++) {
-        float math_x = (float)(x - 400);
-        float math_y = 0;
+    if (osc->timebase_us_per_div >= 1000U) {
+        (void)snprintf(text, sizeof(text), "T:%lums/D",
+                       (unsigned long)(osc->timebase_us_per_div / 1000U));
+    } else {
+        (void)snprintf(text, sizeof(text), "T:%luus/D",
+                       (unsigned long)osc->timebase_us_per_div);
+    }
+    draw_text(210, 8, text, COLOR_WHITE, 2U);
 
-        if (current_wave == WAVE_SINE) {
-            math_y = current_amplitude * sin(math_x * current_omega + current_phase);
+    format_fixed(value, sizeof(value), osc->volts_per_div, 2U);
+    (void)snprintf(text, sizeof(text), "V:%sV/D", value);
+    draw_text(355, 8, text, COLOR_WHITE, 2U);
+
+    format_fixed(value, sizeof(value), osc->trigger_level_v, 2U);
+    (void)snprintf(text, sizeof(text), "TRG:%sV", value);
+    draw_text(510, 8, text, COLOR_RED, 2U);
+
+    draw_button(10, 60, 80, 45, "TIME", current_ctrl == CTRL_TIMEBASE, COLOR_BLUE);
+    draw_button(10, 115, 80, 45, "V/D", current_ctrl == CTRL_VOLTS_DIV, COLOR_BLUE);
+    draw_button(10, 170, 80, 45, "TRIG", current_ctrl == CTRL_TRIGGER_LEVEL, COLOR_BLUE);
+    draw_button(10, 225, 80, 45, "POS", current_ctrl == CTRL_VERTICAL_POS, COLOR_BLUE);
+
+    draw_button(710, 60, 80, 45, osc->running ? "RUN" : "HOLD",
+                true, osc->running ? COLOR_GREEN : COLOR_YELLOW);
+    draw_button(710, 115, 80, 45,
+                osc->trigger_slope == OSC_TRIGGER_RISING ? "RISE" : "FALL",
+                true, COLOR_RED);
+    draw_button(710, 170, 80, 45, "SINGLE", false, COLOR_WHITE);
+    draw_button(710, 5, 80, 40, "HOME", false, COLOR_WHITE);
+
+    if (osc->frame_valid) {
+        if (osc->frequency_hz >= 1000.0f) {
+            format_fixed(value, sizeof(value), osc->frequency_hz / 1000.0f, 2U);
+            (void)snprintf(text, sizeof(text), "F:%skHz", value);
+        } else {
+            (void)snprintf(text, sizeof(text), "F:%luHz",
+                           (unsigned long)(osc->frequency_hz + 0.5f));
         }
-        else if (current_wave == WAVE_SQUARE) {
-            math_y = (sin(math_x * current_omega + current_phase) >= 0) ? current_amplitude : -current_amplitude;
+        draw_text(110, 442, text, COLOR_GREEN, 2U);
+
+        format_fixed(value, sizeof(value), osc->vpp_v, 2U);
+        (void)snprintf(text, sizeof(text), "VPP:%sV", value);
+        draw_text(300, 442, text, COLOR_YELLOW, 2U);
+
+        format_fixed(value, sizeof(value), osc->average_v, 2U);
+        (void)snprintf(text, sizeof(text), "AVG:%sV", value);
+        draw_text(490, 442, text, COLOR_CYAN, 2U);
+    } else {
+        draw_text(280, 442, "WAITING FOR ADC", COLOR_YELLOW, 2U);
+    }
+}
+
+void Draw_Waveform(void)
+{
+    const OscilloscopeState *osc = Oscilloscope_GetState();
+    if (!osc->frame_valid) return;
+
+    uint16_t count = 0U;
+    const uint16_t *trace = Oscilloscope_GetTrace(&count);
+    const float pixels_per_volt = ((float)PLOT_H / 8.0f) / osc->volts_per_div;
+    int previous_y = PLOT_Y + PLOT_H / 2;
+
+    int trigger_y = PLOT_Y + PLOT_H / 2 -
+                    (int)((osc->trigger_level_v - osc->vertical_center_v) *
+                          pixels_per_volt);
+    if (trigger_y >= PLOT_Y && trigger_y <= PLOT_Y + PLOT_H) {
+        for (int x = PLOT_X; x < PLOT_X + PLOT_W; x += 8) {
+            Draw_Line_L8(x, trigger_y, x + 3, trigger_y, COLOR_RED);
         }
-        else if (current_wave == WAVE_TRIANGLE) {
-            math_y = (current_amplitude * 2.0f / M_PI) * asinf(sinf(math_x * current_omega + current_phase));
+    }
+
+    for (uint16_t i = 0U; i < count; ++i) {
+        const float volts = (float)trace[i] * OSC_INPUT_FULL_V / (float)OSC_ADC_MAX;
+        int y = PLOT_Y + PLOT_H / 2 -
+                (int)((volts - osc->vertical_center_v) * pixels_per_volt);
+        if (y < PLOT_Y) y = PLOT_Y;
+        if (y > PLOT_Y + PLOT_H) y = PLOT_Y + PLOT_H;
+        if (i > 0U) {
+            Draw_Line_L8(PLOT_X + (int)i - 1, previous_y,
+                         PLOT_X + (int)i, y, COLOR_YELLOW);
         }
-
-        int y = current_offset_y - (int)math_y;
-        if (x > 0) Draw_Line_L8(prev_x, prev_y, x, y, 5);
-        prev_x = x;
-        prev_y = y;
+        previous_y = y;
     }
 }
 
-// ==========================================================
-// 极客专属：算法生成七段数码管数字和单位字符
-// ==========================================================
-void Draw_7Seg(int x, int y, int val, uint8_t c, int s) {
-    uint8_t segs[10] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
-    if(val<0 || val>9) return;
-    uint8_t mask = segs[val];
-    // 粗犷线条，用两条线并排增加厚度
-    if(mask & 1) { Draw_Line_L8(x, y, x+s, y, c); Draw_Line_L8(x, y+1, x+s, y+1, c); }
-    if(mask & 2) { Draw_Line_L8(x+s, y, x+s, y+s, c); Draw_Line_L8(x+s-1, y, x+s-1, y+s, c); }
-    if(mask & 4) { Draw_Line_L8(x+s, y+s, x+s, y+2*s, c); Draw_Line_L8(x+s-1, y+s, x+s-1, y+2*s, c); }
-    if(mask & 8) { Draw_Line_L8(x, y+2*s, x+s, y+2*s, c); Draw_Line_L8(x, y+2*s-1, x+s, y+2*s-1, c); }
-    if(mask & 16){ Draw_Line_L8(x, y+s, x, y+2*s, c); Draw_Line_L8(x+1, y+s, x+1, y+2*s, c); }
-    if(mask & 32){ Draw_Line_L8(x, y, x, y+s, c); Draw_Line_L8(x+1, y, x+1, y+s, c); }
-    if(mask & 64){ Draw_Line_L8(x, y+s, x+s, y+s, c); Draw_Line_L8(x, y+s-1, x+s, y+s-1, c); }
-}
-
-void Draw_Number(int x, int y, int num, uint8_t c, int s) {
-    if(num == 0) { Draw_7Seg(x, y, 0, c, s); return; }
-    int digits[10], cnt=0;
-
-    while(num > 0) { digits[cnt++] = num%10; num/=10; }
-
-    for(int i = 0; i < cnt; i++) {
-        // i=0 时，画 digits[cnt-1] (最高位)，偏移 0*(s+8)
-        // i 越大，画的位数越低，向右的偏移量越大
-        Draw_7Seg(x + i * (s + 8), y, digits[cnt - 1 - i], c, s);
+static void icon_sine(uint16_t x, uint16_t y, uint8_t color)
+{
+    for (int i = 5; i < 55; ++i) {
+        int py = y + 15 - (int)(10.0f * sinf((float)(i - 5) * 0.15f));
+        Draw_Line_L8(x + i, py, x + i, py, color);
     }
 }
 
-void Draw_Text_Hz(int x, int y, uint8_t c, int s) {
-    Draw_Line_L8(x, y, x, y+2*s, c); Draw_Line_L8(x+s, y, x+s, y+2*s, c); Draw_Line_L8(x, y+s, x+s, y+s, c); // H
-    Draw_Line_L8(x+s+6, y+s, x+2*s+6, y+s, c); Draw_Line_L8(x+2*s+6, y+s, x+s+6, y+2*s, c); Draw_Line_L8(x+s+6, y+2*s, x+2*s+6, y+2*s, c); // z
+static void icon_square(uint16_t x, uint16_t y, uint8_t color)
+{
+    Draw_Line_L8(x + 8, y + 22, x + 28, y + 22, color);
+    Draw_Line_L8(x + 28, y + 22, x + 28, y + 8, color);
+    Draw_Line_L8(x + 28, y + 8, x + 52, y + 8, color);
 }
 
-void Draw_Text_V(int x, int y, uint8_t c, int s) {
-    Draw_Line_L8(x, y, x+s/2, y+2*s, c); Draw_Line_L8(x+s/2, y+2*s, x+s, y, c);
+static void icon_triangle(uint16_t x, uint16_t y, uint8_t color)
+{
+    Draw_Line_L8(x + 8, y + 23, x + 30, y + 7, color);
+    Draw_Line_L8(x + 30, y + 7, x + 52, y + 23, color);
 }
 
-void Draw_Dot(int x, int y, uint8_t c, int s) {
-    Draw_Line_L8(x, y+2*s, x+2, y+2*s, c); Draw_Line_L8(x, y+2*s-1, x+2, y+2*s-1, c);
+void Draw_Main_Menu(void)
+{
+    clear_screen();
+    draw_text(182, 45, "H745 OSCILLOSCOPE + GENERATOR", COLOR_CYAN, 2U);
+    draw_button(130, 130, 250, 220, "OSC", main_menu_sel == 0U, COLOR_GREEN);
+    draw_button(420, 130, 250, 220, "GEN", main_menu_sel == 1U, COLOR_BLUE);
+    draw_text(210, 375, "TOUCH A MODE", COLOR_WHITE, 3U);
 }
 
-void Draw_Rect(int x, int y, int w, int h, uint8_t c) {
-    Draw_Line_L8(x, y, x+w, y, c); Draw_Line_L8(x, y+h, x+w, y+h, c);
-    Draw_Line_L8(x, y, x, y+h, c); Draw_Line_L8(x+w, y, x+w, y+h, c);
+void Draw_WaveGen_UI(void)
+{
+    clear_screen();
+    draw_text(8, 8, "WAVE GENERATOR", COLOR_BLUE, 2U);
+    draw_button(710, 5, 80, 40, "HOME", false, COLOR_WHITE);
+
+    Draw_UI_Button(20, 70, wg_wave == WAVE_SINE, icon_sine);
+    Draw_UI_Button(20, 120, wg_wave == WAVE_SQUARE, icon_square);
+    Draw_UI_Button(20, 170, wg_wave == WAVE_TRIANGLE, icon_triangle);
+
+    draw_button(180, 90, 500, 120, "FREQUENCY", wg_ctrl == 0U, COLOR_BLUE);
+    draw_button(180, 260, 500, 120, "AMPLITUDE", wg_ctrl == 1U, COLOR_RED);
+
+    char text[32];
+    char value[16];
+    (void)snprintf(text, sizeof(text), "%lu Hz", (unsigned long)wg_freq);
+    draw_text(335, 165, text, wg_ctrl == 0U ? COLOR_BLUE : COLOR_WHITE, 3U);
+    format_fixed(value, sizeof(value), wg_amp, 2U);
+    (void)snprintf(text, sizeof(text), "%s V", value);
+    draw_text(360, 335, text, wg_ctrl == 1U ? COLOR_RED : COLOR_WHITE, 3U);
+    draw_text(215, 425, "DAC1 OUT2: PA5", COLOR_YELLOW, 2U);
 }
 
-// ==========================================================
-// 菜单与 UI 绘制
-// ==========================================================
-// --- 内部函数：绘制字母 O-S-C ---
-static void Draw_Text_OSC(uint16_t x, uint16_t y, uint8_t c, int s) {
-    // O
-    Draw_Rect(x, y, s, 2 * s, c);
-    // S
-    //Draw_7Seg(x + s + 10, y, 5, c, s);
-    Draw_Line_L8(x + s + 10, y, x + 2 * s + 10, y, c);                  // 上
-    Draw_Line_L8(x + s + 10, y, x + s + 10, y + s, c);                  // 左
-    Draw_Line_L8(x + s + 10, y + s, x + 2 * s + 10, y + s, c);          // 中
-    Draw_Line_L8(x + 2 * s + 10, y + s, x + 2 * s + 10, y + 2 * s, c);  // 右
-    Draw_Line_L8(x + s + 10, y + 2 * s, x + 2 * s + 10, y + 2 * s, c);  // 下
-    // C
-    Draw_Line_L8(x + 2 * s + 20, y, x + 3 * s + 20, y, c);         // 上
-    Draw_Line_L8(x + 2 * s + 20, y, x + 2 * s + 20, y + 2 * s, c); // 左
-    Draw_Line_L8(x + 2 * s + 20, y + 2 * s, x + 3 * s + 20, y + 2 * s, c); // 下
-}
-
-// --- 内部函数：绘制字母 G-E-N ---
-static void Draw_Text_GEN(uint16_t x, uint16_t y, uint8_t c, int s) {
-    // G (在 C 的基础上加一横)
-    Draw_Line_L8(x, y, x + s, y, c);         // 上
-    Draw_Line_L8(x, y, x, y + 2 * s, c);     // 左
-    Draw_Line_L8(x, y + 2 * s, x + s, y + 2 * s, c); // 下
-    Draw_Line_L8(x + s, y + s, x + s, y + 2 * s, c); // 右下
-    Draw_Line_L8(x + s/2, y + s, x + s, y + s, c);   // 中间一横
-
-    // E (三横一竖)
-    int x_e = x + s + 10;
-    Draw_Line_L8(x_e, y, x_e, y + 2 * s, c);
-    Draw_Line_L8(x_e, y, x_e + s, y, c);
-    Draw_Line_L8(x_e, y + s, x_e + s, y + s, c);
-    Draw_Line_L8(x_e, y + 2 * s, x_e + s, y + 2 * s, c);
-
-    // N (两竖一斜)
-    int x_n = x + 2 * s + 20;
-    Draw_Line_L8(x_n, y, x_n, y + 2 * s, c);
-    Draw_Line_L8(x_n + s, y, x_n + s, y + 2 * s, c);
-    Draw_Line_L8(x_n, y, x_n + s, y + 2 * s, c);
-}
-
-// 1. 顶层主菜单
-// graph.c
-
-void Draw_Main_Menu(void) {
-    uint8_t *fb = (uint8_t *)0x24020000;
-    for(uint32_t i = 0; i < 800 * 480; i++) fb[i] = 0; // 清屏
-
-    // --- 左侧：OSCILLOSCOPE 模式 ---
-    uint8_t c_osc = (main_menu_sel == 0) ? 1 : 4;
-    Draw_Rect(150, 140, 200, 200, c_osc);
-    // 在框内绘制 "OSC"，s=40 为字母大小，位置居中微调
-    Draw_Text_OSC(185, 200, c_osc, 40);
-
-    // --- 右侧：GENERATOR 模式 ---
-    uint8_t c_gen = (main_menu_sel == 1) ? 3 : 4;
-    Draw_Rect(450, 140, 200, 200, c_gen);
-    // 在框内绘制 "GEN"
-    Draw_Text_GEN(485, 200, c_gen, 40);
-}
-
-// 2. 示波器 UI (保持不变)
-
-
-// 3. 波形发生器 UI
-void Draw_WaveGen_UI(void) {
-    uint8_t *fb = (uint8_t *)0x24020000;
-    for(uint32_t i = 0; i < 800 * 480; i++) fb[i] = 0; // 波形发生界面保持纯黑背景，更专业
-
-    // 左侧：复用小矩形显示当前输出的波形
-    Draw_UI_Button(20, 50,  (wg_wave == WAVE_SINE), Icon_Sine);
-    Draw_UI_Button(20, 100, (wg_wave == WAVE_SQUARE), Icon_Square);
-    Draw_UI_Button(20, 150, (wg_wave == WAVE_TRIANGLE), Icon_Triangle);
-
-    // 右侧：大方框控制频率和幅值
-    uint8_t c_freq = (wg_ctrl == 0) ? 3 : 4; // 频率框颜色
-    uint8_t c_amp  = (wg_ctrl == 1) ? 1 : 4; // 幅值框颜色
-
-    Draw_Rect(300, 100, 400, 100, c_freq);
-    Draw_Number(350, 130, (int)wg_freq, c_freq, 20);
-    Draw_Text_Hz(600, 130, c_freq, 20);
-
-    Draw_Rect(300, 250, 400, 100, c_amp);
-    int a_int = (int)wg_amp;
-    int a_frac = (int)((wg_amp - a_int) * 10);
-    Draw_Number(350, 280, a_int, c_amp, 20);
-    Draw_Dot(400, 280, c_amp, 20);
-    Draw_Number(430, 280, a_frac, c_amp, 20);
-    Draw_Text_V(500, 280, c_amp, 20);
-}
-
-#define FB_ADDR 0x24020000
-#define WIDTH 800
-#define HEIGHT 480
-
-void Draw_Block(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color) {
-    uint8_t* fb = (uint8_t*)FB_ADDR;
-    for(int i = 0; i < h; i++) {
-        if (y + i >= HEIGHT) break;
-        memset(fb + (y + i) * WIDTH + x, color, w);
-    }
-}
-
-// 辅助函数：绘制单像素点
-void Draw_Pixel(uint16_t x, uint16_t y, uint8_t color) {
-    if (x < WIDTH && y < HEIGHT) {
-        *((uint8_t*)(FB_ADDR + y * WIDTH + x)) = color;
-    }
-}
-
-// 💥 终极炫酷开机动画：Cyber Boot Sequence
-void Play_Cyber_Boot_Sequence(void) {
-    uint8_t* fb = (uint8_t*)FB_ADDR;
-
-    // 清空屏幕为纯黑
-    memset(fb, 0, WIDTH * HEIGHT);
-    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-        SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
-    }
-    HAL_Delay(200);
-
-    // ==========================================
-    // Phase 1: Grid Initialization (底层网格扫描)
-    // ==========================================
-    for (int y = 0; y < HEIGHT; y += 8) {
-        memset(fb, 0, WIDTH * HEIGHT); // 刷黑
-
-        // 绘制静态背景网格点
-        for (int gy = 0; gy < y; gy += 40) {
-            for (int gx = 0; gx < WIDTH; gx += 40) {
-                Draw_Pixel(gx, gy, 2); // 假设 2 是暗绿色
-            }
-        }
-
-        // 绘制正在扫描的高亮横线
-        memset(fb + y * WIDTH, 3, WIDTH); // 假设 3 是亮蓝色
-        memset(fb + (y+1) * WIDTH, 3, WIDTH);
-
+void Play_Cyber_Boot_Sequence(void)
+{
+    clear_screen();
+    draw_text(245, 170, "H745 OSC-GEN", COLOR_CYAN, 4U);
+    draw_rect(180, 260, 440, 24, COLOR_WHITE);
+    for (int width = 0; width <= 436; width += 12) {
+        fill_rect(182, 262, width, 20, COLOR_BLUE);
         if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-            SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
+            SCB_CleanDCache_by_Addr((uint32_t *)FB_ADDR, SCREEN_W * SCREEN_H);
         }
-        HAL_Delay(10); // 速度控制
-    }
-
-    // ==========================================
-    // Phase 2: Cluster Diagnostics (集群算力并发检测)
-    // ==========================================
-    // 屏幕中央出现高速随机跳动的色块，模拟内核加载
-    int center_x = WIDTH / 2;
-    int center_y = HEIGHT / 2;
-
-    for (int frames = 0; frames < 40; frames++) {
-        memset(fb, 0, WIDTH * HEIGHT); // 刷黑
-
-        for(int block = 0; block < 15; block++) {
-            // 利用简单的线性同余生成伪随机数，极速运算
-            uint16_t rw = (frames * block * 17) % 100 + 10;
-            uint16_t rh = (frames * block * 23) % 20 + 5;
-            uint16_t rx = center_x - 200 + ((frames * block * 31) % 400);
-            uint16_t ry = center_y - 50 + ((frames * block * 37) % 100);
-            uint8_t rcol = (frames * block % 3) + 3; // 随机取颜色索引 3,4,5
-
-            Draw_Block(rx, ry, rw, rh, rcol);
-        }
-
-        // 中央主干进度条
-        Draw_Block(center_x - (frames * 5), center_y + 100, frames * 10, 4, 1); // 假设 1 是纯白
-
-        if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-            SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
-        }
-        HAL_Delay(15);
-    }
-
-    // ==========================================
-    // Phase 3: Geometric Sonar Sweep (雷达波纹演算)
-    // 动用 M7 的 FPU 进行极速浮点画圆演算
-    // ==========================================
-    for (int radius = 10; radius < 450; radius += 15) {
-        memset(fb, 0, WIDTH * HEIGHT);
-
-        // 画多个几何圆环
-        for (int r = radius; r > 0; r -= 40) {
-            for (float angle = 0; angle < 6.28f; angle += 0.05f) { // 极速弧度遍历
-                uint16_t x = center_x + (uint16_t)(r * cosf(angle));
-                uint16_t y = center_y + (uint16_t)(r * sinf(angle));
-                Draw_Pixel(x, y, 4); // 假设 4 是青色
-
-                // 加粗外圈
-                if (r == radius) {
-                    Draw_Pixel(x+1, y, 4);
-                    Draw_Pixel(x, y+1, 4);
-                }
-            }
-        }
-
-        // 核心十字准星
-        Draw_Block(center_x - 50, center_y, 100, 2, 1);
-        Draw_Block(center_x, center_y - 50, 2, 100, 1);
-
-        if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-            SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
-        }
-        HAL_Delay(15);
-    }
-
-    // ==========================================
-    // Phase 4: Hyperspace Clear (超空间跃迁)
-    // ==========================================
-    // 屏幕从中间向上下拉开，完美过渡到你的正常界面
-    for (int gap = 0; gap <= HEIGHT / 2; gap += 10) {
-        memset(fb, 0, WIDTH * HEIGHT);
-
-        // 留下一丝极具速度感的残影横线
-        memset(fb + (center_y - gap) * WIDTH, 1, WIDTH);
-        memset(fb + (center_y + gap) * WIDTH, 1, WIDTH);
-
-        if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-            SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
-        }
-        HAL_Delay(10);
-    }
-
-    // 确保最后交给 UI 渲染前，显存是纯净的
-    memset(fb, 0, WIDTH * HEIGHT);
-    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-        SCB_CleanDCache_by_Addr((uint32_t*)fb, WIDTH * HEIGHT);
+        HAL_Delay(5U);
     }
 }

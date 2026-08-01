@@ -41,6 +41,7 @@ MEMORY
 FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 1024K
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
 ITCMRAM (xrw)      : ORIGIN = 0x00000000, LENGTH = 64K
+D2RAM (xrw)     : ORIGIN = 0x30000000, LENGTH = 288K
 }
 /* Highest address of the user mode stack */
 _estack = 0x20020000;    /* end of RAM */
@@ -140,6 +141,15 @@ SECTIONS
 
     . = ALIGN(4);
   } >RAM AT> FLASH
+
+  /* DMA1/DMA2 cannot access CM7 DTCM (0x20000000). */
+  .dma_buffer (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.dma_buffer)
+    *(.dma_buffer*)
+    . = ALIGN(32);
+  } >D2RAM
 
   /* Initialized TLS data section */
   .tdata : ALIGN(4)

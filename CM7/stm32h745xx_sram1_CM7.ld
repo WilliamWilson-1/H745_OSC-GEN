@@ -40,6 +40,7 @@ MEMORY
 {
 RAM_EXEC (rx)      : ORIGIN = 0x24000000, LENGTH = 256K
 RAM (xrw)      : ORIGIN = 0x24040000, LENGTH = 256K
+D2RAM (xrw)     : ORIGIN = 0x30000000, LENGTH = 288K
 }
 /* Highest address of the user mode stack */
 _estack = 0x24080000;    /* end of RAM */
@@ -129,6 +130,15 @@ SECTIONS
 
     . = ALIGN(4);
   } >RAM AT> RAM_EXEC
+
+  /* DMA1/DMA2-accessible buffers. */
+  .dma_buffer (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.dma_buffer)
+    *(.dma_buffer*)
+    . = ALIGN(32);
+  } >D2RAM
 
   /* Initialized TLS data section */
   .tdata : ALIGN(4)

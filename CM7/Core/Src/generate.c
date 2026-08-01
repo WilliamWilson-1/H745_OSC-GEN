@@ -2,17 +2,23 @@
 #include "main.h"
 #include <math.h>
 
-// 💥 1. 注释掉普通的全局数组定义 (它默认会被丢进 DMA 无法访问的 0x24000000)
-// uint16_t wave_table[WAVE_POINTS];
-
-// 💥 2. 暴力物理重定向：强行将波形表定位到 DMA1 绝对能访问的 D2 域 SRAM1 首地址！
-#define wave_table ((uint16_t *)0x30000000)
+/* Keep the DAC lookup table in DMA1-accessible D2 SRAM. */
+__attribute__((section(".dma_buffer"), aligned(32)))
+uint16_t wave_table[WAVE_POINTS];
 
 void DAC_WaveGen_Init(void) {
     // 启动 DMA 传输，对准通道 2 (PA5)
-    HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_2, (uint32_t*)wave_table, WAVE_POINTS, DAC_ALIGN_12B_R);
+    if (HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_2, (uint32_t*)wave_table,
+                          WAVE_POINTS, DAC_ALIGN_12B_R) != HAL_OK) {
+        Error_Handler();
+    }
+    /* Circular playback needs no half/full-transfer callbacks. Disabling
+     * them avoids one DMA interrupt per generated waveform period. */
+    __HAL_DMA_DISABLE_IT(hdac1.DMA_Handle2, DMA_IT_HT | DMA_IT_TC);
     // 启动触发用的 TIM6
-    HAL_TIM_Base_Start(&htim6);
+    if (HAL_TIM_Base_Start(&htim6) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
 void DAC_Generate_Wave(WaveType type, float dac_amplitude) {
