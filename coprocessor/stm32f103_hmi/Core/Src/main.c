@@ -205,6 +205,15 @@ uint16_t marquee_len = sizeof(marquee_str) - 1;
 uint8_t rx_byte;
 char rx_str[32];
 uint8_t rx_idx = 0;
+static uint8_t touch_contact_active = 0U;
+
+static void cancel_touch_contact(void) {
+    if (touch_contact_active != 2U) {
+        static const uint8_t cancel_msg[] = "C:\n";
+        HAL_UART_Transmit(&huart1, (uint8_t*)cancel_msg, sizeof(cancel_msg)-1U, 10);
+    }
+    touch_contact_active = 2U;
+}
 
 void Parse_Command(char* cmd) {
     char vfd_buf[16] = {0};
@@ -331,30 +340,61 @@ int main(void)
       HAL_StatusTypeDef res = HAL_I2C_Mem_Read(&hi2c1, 0x28, 0x814E, I2C_MEMADD_SIZE_16BIT, &status, 1, 100);
 
       if (res != HAL_OK) {
+          cancel_touch_contact();
           if (!anim_mode) vfd_display_string(" ERR-I2C");
       }
       else {
           if (status & 0x80) {
               uint8_t touch_count = status & 0x0F;
               if (touch_count == 1) {
-                  uint8_t coord_buf[4] = {0};
-                  HAL_I2C_Mem_Read(&hi2c1, 0x28, 0x8150, I2C_MEMADD_SIZE_16BIT, coord_buf, 4, 100);
-                  uint16_t touch_x = ((uint16_t)coord_buf[1] << 8) | coord_buf[0];
-                  uint16_t touch_y = ((uint16_t)coord_buf[3] << 8) | coord_buf[2];
-                  char t_buf[32];
-                  sprintf(t_buf, "T:%d,%d\n", touch_x, touch_y);
-                  HAL_UART_Transmit(&huart1, (uint8_t*)t_buf, strlen(t_buf), 10);
+                  /* T starts a contact; D updates it without retriggering
+                   * buttons. After multi-touch, ignore a remaining finger
+                   * until all contacts have lifted. */
+                  if (touch_contact_active != 2U) {
+                      uint8_t coord_buf[4] = {0};
+                      if (HAL_I2C_Mem_Read(&hi2c1, 0x28, 0x8150,
+                                           I2C_MEMADD_SIZE_16BIT,
+                                           coord_buf, 4, 100) == HAL_OK) {
+                          uint16_t touch_x = ((uint16_t)coord_buf[1] << 8) | coord_buf[0];
+                          uint16_t touch_y = ((uint16_t)coord_buf[3] << 8) | coord_buf[2];
+                          char t_buf[32];
+                          snprintf(t_buf, sizeof(t_buf), "%c:%u,%u\n",
+                                   touch_contact_active == 0U ? 'T' : 'D',
+                                   (unsigned int)touch_x, (unsigned int)touch_y);
+                          HAL_UART_Transmit(&huart1, (uint8_t*)t_buf, strlen(t_buf), 10);
+                          touch_contact_active = 1U;
+                      } else {
+                          cancel_touch_contact();
+                      }
+                  }
               }
               else if (touch_count >= 2) {
+                  /* Cancel before reading coordinates: even a failed I2C
+                   * read must not let a later U commit a pending output tap. */
+                  cancel_touch_contact();
                   uint8_t multi_buf[12] = {0};
-                  HAL_I2C_Mem_Read(&hi2c1, 0x28, 0x8150, I2C_MEMADD_SIZE_16BIT, multi_buf, 12, 100);
-                  uint16_t x1 = ((uint16_t)multi_buf[1] << 8) | multi_buf[0];
-                  uint16_t y1 = ((uint16_t)multi_buf[3] << 8) | multi_buf[2];
-                  uint16_t x2 = ((uint16_t)multi_buf[9] << 8) | multi_buf[8];
-                  uint16_t y2 = ((uint16_t)multi_buf[11] << 8) | multi_buf[10];
-                  char m_buf[64];
-                  sprintf(m_buf, "M:%d,%d,%d,%d\n", x1, y1, x2, y2);
-                  HAL_UART_Transmit(&huart1, (uint8_t*)m_buf, strlen(m_buf), 10);
+                  if (HAL_I2C_Mem_Read(&hi2c1, 0x28, 0x8150,
+                                       I2C_MEMADD_SIZE_16BIT,
+                                       multi_buf, 12, 100) == HAL_OK) {
+                      uint16_t x1 = ((uint16_t)multi_buf[1] << 8) | multi_buf[0];
+                      uint16_t y1 = ((uint16_t)multi_buf[3] << 8) | multi_buf[2];
+                      uint16_t x2 = ((uint16_t)multi_buf[9] << 8) | multi_buf[8];
+                      uint16_t y2 = ((uint16_t)multi_buf[11] << 8) | multi_buf[10];
+                      char m_buf[64];
+                      snprintf(m_buf, sizeof(m_buf), "M:%u,%u,%u,%u\n",
+                               (unsigned int)x1, (unsigned int)y1,
+                               (unsigned int)x2, (unsigned int)y2);
+                      HAL_UART_Transmit(&huart1, (uint8_t*)m_buf, strlen(m_buf), 10);
+                  }
+                  touch_contact_active = 2U;
+              }
+              else {
+                  if (touch_contact_active != 0U) {
+                      static const uint8_t release_msg[] = "U:\n";
+                      HAL_UART_Transmit(&huart1, (uint8_t*)release_msg,
+                                        sizeof(release_msg) - 1U, 10);
+                  }
+                  touch_contact_active = 0U;
               }
               uint8_t clear_cmd = 0x00;
               HAL_I2C_Mem_Write(&hi2c1, 0x28, 0x814E, I2C_MEMADD_SIZE_16BIT, &clear_cmd, 1, 100);
@@ -381,6 +421,7 @@ void SystemClock_Config(void)
   * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  /* The connected 64 KiB STM32F103 target uses its on-board 8 MHz crystal. */
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;

@@ -23,11 +23,22 @@ typedef struct {
     float vertical_center_v;
     float frequency_hz;
     float vpp_v;
+    float minimum_v;
+    float maximum_v;
     float average_v;
     OscTriggerSlope trigger_slope;
     bool running;
+    bool single_active;
     bool frame_valid;
+    bool fine_adjustment;
 } OscilloscopeState;
+
+typedef struct {
+    uint32_t completed_frames;
+    uint32_t adc_errors;
+    uint32_t start_errors;
+} OscilloscopeDiagnostics;
+extern volatile OscilloscopeDiagnostics osc_diagnostics;
 
 extern ADC_HandleTypeDef hadc1;
 extern DMA_HandleTypeDef hdma_adc1;
@@ -47,6 +58,11 @@ void Oscilloscope_AdjustTimebase(int steps);
 void Oscilloscope_AdjustVoltsPerDiv(int steps);
 void Oscilloscope_AdjustTrigger(int steps);
 void Oscilloscope_AdjustVerticalPosition(int steps);
+void Oscilloscope_SetFineAdjustment(bool fine);
+void Oscilloscope_AdjustTimebaseFine(int steps);
+void Oscilloscope_AdjustVoltsPerDivFine(int steps);
+void Oscilloscope_AdjustTriggerFine(int steps);
+void Oscilloscope_AdjustVerticalPositionFine(int steps);
 void Oscilloscope_SetTriggerSlope(OscTriggerSlope slope);
 
 const OscilloscopeState *Oscilloscope_GetState(void);

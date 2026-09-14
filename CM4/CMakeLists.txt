@@ -42,6 +42,8 @@ add_executable(${CMAKE_PROJECT_NAME})
 
 # Include mx-generated
 include("mx-generated.cmake")
+set_property(TARGET ${CMAKE_PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/${STM32_LINKER_SCRIPT}")
 
 
 # In order to use CMake for cross-compiling
@@ -88,7 +90,6 @@ list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 if((CMAKE_C_STANDARD EQUAL 90) OR (CMAKE_C_STANDARD EQUAL 99))
     message(ERROR "Generated code requires C11 or higher")
 endif()
-
 
 
 

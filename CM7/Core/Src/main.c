@@ -27,6 +27,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "graph.h"
+#include "display.h"
 #include "generate.h"
 #include "oscilloscope.h"
 /* USER CODE END Includes */
@@ -100,8 +101,7 @@ static void MX_TIM6_Init(void);
 // 💥 封装一个硬件同步中心：把 0~3.3V 转化为 0~2047 写入底层
 void Sync_Hardware_WaveGen(void) {
     float hw_amp = (wg_amp / 3.3f) * 2047.0f;
-    DAC_Generate_Wave(wg_wave, hw_amp);
-    DAC_Set_Frequency((uint32_t)wg_freq);
+    DAC_WaveGen_Configure(wg_wave, hw_amp, (uint32_t)wg_freq);
 }
 
 // 双指手势引擎内部变量
@@ -122,85 +122,83 @@ void UART_SendToF103(const char *format, ...) {
 // 触摸与重绘全局标志
 volatile uint8_t global_needs_redraw = 0;
 uint8_t h7_rx_byte;
-char h7_cmd_buf[32];
-uint8_t h7_cmd_idx = 0;
+static uint8_t touch_rx[256];
+static volatile uint16_t touch_head, touch_tail;
+static volatile uint8_t touch_overflow;
+static void Poll_Touch_Input(void);
+
+static void Reset_Current_Mode(void) {
+    UI_OutputTouchCancel(HAL_GetTick());
+    if (current_sys_state == SYS_MAIN_MENU) return;
+    if (current_sys_state == SYS_OSC) {
+        Oscilloscope_ResetControls();
+        current_ctrl = CTRL_TIMEBASE;
+    } else if (current_sys_state == SYS_GEN) {
+        wg_freq = 1000.0f;
+        wg_amp = 3.3f;
+        wg_wave = WAVE_SINE;
+        wg_ctrl = 0U;
+        wg_enabled = 0U;
+        DAC_WaveGen_SetEnabled(0U);
+        Sync_Hardware_WaveGen();
+        UART_SendToF103("F:1000\n");
+        UART_SendToF103("A:3.3\n");
+    }
+    UI_NotifyReset(HAL_GetTick());
+    global_needs_redraw = 1U;
+}
 
 // =========================================================
 // 核心：带有“防抖与差分拦截”的触摸碰撞引擎
 // =========================================================
 void Process_Touch_Interaction(uint16_t x, uint16_t y) {
+    UI_OutputTouchCancel(HAL_GetTick());
+    global_needs_redraw = 1U;
     is_pinching = 0;
-    uint8_t old_state = current_sys_state;
-    uint8_t old_sel   = main_menu_sel;
-    uint8_t old_ctrl  = current_ctrl;
-    uint8_t old_wg_w  = wg_wave;
-    uint8_t old_wg_c  = wg_ctrl;
-
-    if (current_sys_state != SYS_MAIN_MENU && x > 700 && y < 60) {
-        if (current_sys_state == SYS_OSC) Oscilloscope_Stop();
+    UiAction action = UI_HitTest(current_sys_state, x, y);
+    if (action == UI_NONE) return;
+    UI_NotifyTouch(action, HAL_GetTick());
+    switch (action) {
+    case UI_HOME:
+        /* Keep RUN live on Home; HOLD/SINGLE state remains authoritative. */
         current_sys_state = SYS_MAIN_MENU;
+        UART_SendToF103("I:\n");
+        break;
+    case UI_OSC:
+        main_menu_sel = 0;
+        current_sys_state = SYS_OSC;
+        break;
+    case UI_GEN:
+        main_menu_sel = 1;
+        current_sys_state = SYS_GEN;
+        UART_SendToF103("F:%d\n", (int)wg_freq);
+        break;
+    case UI_TIME: current_ctrl = CTRL_TIMEBASE; break;
+    case UI_VOLTS: current_ctrl = CTRL_VOLTS_DIV; break;
+    case UI_TRIGGER: current_ctrl = CTRL_TRIGGER_LEVEL; break;
+    case UI_POSITION: current_ctrl = CTRL_VERTICAL_POS; break;
+    case UI_RUN: Oscilloscope_ToggleRun(); break;
+    case UI_SLOPE:
+        Oscilloscope_SetTriggerSlope(Oscilloscope_GetState()->trigger_slope ==
+            OSC_TRIGGER_RISING ? OSC_TRIGGER_FALLING : OSC_TRIGGER_RISING);
+        break;
+    case UI_SINGLE: Oscilloscope_Single(); break;
+    case UI_COARSE: Oscilloscope_SetFineAdjustment(false); break;
+    case UI_FINE: Oscilloscope_SetFineAdjustment(true); break;
+    case UI_SINE: case UI_SQUARE: case UI_TRIANGLE:
+        wg_wave = action == UI_SINE ? WAVE_SINE :
+                  action == UI_SQUARE ? WAVE_SQUARE : WAVE_TRIANGLE;
+        Sync_Hardware_WaveGen();
+        break;
+    case UI_OUTPUT:
+        UI_OutputTouchDown(x, y, HAL_GetTick());
+        break;
+    case UI_FREQUENCY: wg_ctrl = 0U; break;
+    case UI_AMPLITUDE: wg_ctrl = 1U; break;
+    case UI_MOTION: UI_ToggleMotion(); break;
+    default: break;
     }
-    else if (current_sys_state == SYS_MAIN_MENU) {
-        if (x > 130 && x < 370 && y > 120 && y < 360) {
-            main_menu_sel = 0;
-            current_sys_state = SYS_OSC;
-            Oscilloscope_Start();
-        }
-        else if (x > 430 && x < 670 && y > 120 && y < 360) {
-            main_menu_sel = 1;
-            current_sys_state = SYS_GEN;
-            UART_SendToF103("F:%d\n", (int)wg_freq);
-        }
-    }
-    else if (current_sys_state == SYS_OSC) {
-        if (x > 700U) {
-            const OscilloscopeState *osc = Oscilloscope_GetState();
-            if (y > 60U && y < 115U) {
-                Oscilloscope_ToggleRun();
-                global_needs_redraw = 1U;
-            } else if (y >= 115U && y < 170U) {
-                Oscilloscope_SetTriggerSlope(
-                    osc->trigger_slope == OSC_TRIGGER_RISING ?
-                    OSC_TRIGGER_FALLING : OSC_TRIGGER_RISING);
-                global_needs_redraw = 1U;
-            } else if (y >= 170U && y < 225U) {
-                Oscilloscope_Single();
-                global_needs_redraw = 1U;
-            }
-        } else if (x < 100U) {
-            if (y > 60U && y < 115U) current_ctrl = CTRL_TIMEBASE;
-            else if (y < 170U)       current_ctrl = CTRL_VOLTS_DIV;
-            else if (y < 225U)       current_ctrl = CTRL_TRIGGER_LEVEL;
-            else if (y < 280U)       current_ctrl = CTRL_VERTICAL_POS;
-        }
-    }
-    else if (current_sys_state == SYS_GEN) {
-        if (x < 100) {
-            if (y > 60 && y < 115)       wg_wave = WAVE_SINE;
-            else if (y < 165)            wg_wave = WAVE_SQUARE;
-            else if (y < 215)            wg_wave = WAVE_TRIANGLE;
-
-            // 💥 如果波形种类被触摸改变了，立刻同步给底层 DAC
-            if (old_wg_w != wg_wave) {
-                Sync_Hardware_WaveGen();
-            }
-        }
-        else if (x > 180 && x < 680 && y > 90 && y < 210) {
-            wg_ctrl = 0;
-        }
-        else if (x > 180 && x < 680 && y > 260 && y < 380) {
-            wg_ctrl = 1;
-        }
-    }
-
-    if (old_state != current_sys_state ||
-        old_sel   != main_menu_sel   ||
-        old_ctrl  != current_ctrl    ||
-        old_wg_w  != wg_wave         ||
-        old_wg_c  != wg_ctrl) {
-
-        global_needs_redraw = 1;
-    }
+    global_needs_redraw = 1U;
 }
 
 
@@ -242,9 +240,8 @@ void Process_Pinch_Gesture(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
         // 阈值设为 2 防止手抖抖动
         // 水平捏合：切换采样时基。
 
-        // 双指拉开 (diff_x > 0)，频率降低/波形拉宽；捏合则反之。
-        // 你可以根据视觉习惯修改前面的正负号
-        Oscilloscope_AdjustTimebase(diff_x > 0 ? 1 : -1);
+        // 双指拉开：减小 time/div，让波形沿水平方向放大；捏合则缩小。
+        Oscilloscope_AdjustTimebase(diff_x > 0 ? -1 : 1);
         state_changed = 1;
     }
     else if (abs(diff_y) > abs(diff_x) && abs(diff_y) > 2) {
@@ -342,24 +339,11 @@ Error_Handler();
 
     UART_SendToF103("I:\n");
 
-    // 💥 启动底层波形发生器，并刷入第一次默认参数
+    // 装载默认波形参数；输出保持关闭，进入 GEN 后由 OUTPUT 按钮开启。
     Sync_Hardware_WaveGen();
     DAC_WaveGen_Init();
 
-    // 1. 配置示波器专用调色板 (加入 3 号蓝色用于菜单高亮)
-    my_palette[0] = 0xFF000000; // 0号: 纯黑 (背景)
-    my_palette[1] = 0xFFFF0000; // 1号: 纯红
-    my_palette[2] = 0xFF00FF00; // 2号: 纯绿
-    my_palette[3] = 0xFF0000FF; // 3号: 纯蓝 (选中菜单高亮)
-    my_palette[4] = 0xFFFFFFFF; // 4号: 纯白 (未选中/坐标轴)
-    my_palette[5] = 0xFFFFFF00; // 5号: 纯黄 (波形)
-    my_palette[6] = 0xFF404040; // 6号: 暗灰 (网格)
-
-    HAL_LTDC_ConfigCLUT(&hltdc, my_palette, 256, 0);
-    HAL_LTDC_EnableCLUT(&hltdc, 0);
-    HAL_LTDC_SetAddress(&hltdc, 0x24020000, 0);
-    LTDC->SRCR = LTDC_SRCR_IMR;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET); // 点亮屏幕背光
+    UI_InitPalette();
 
     // 2. 启动编码器硬件解码！(TIM3)
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
@@ -368,14 +352,9 @@ Error_Handler();
         Error_Handler();
     }
 
-    // 3. 画出第一帧初始画面
-    // (注意：这里调用的已经是全面升级后的无参数渲染函数)
-    Draw_Main_Menu();
-
-    // 4. 将第一帧画面推入物理显存
-    if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-        SCB_CleanDCache_by_Addr((uint32_t*)0x24020000, 800 * 480);
-    }
+    // Prepare a complete first frame before lighting the backlight.
+    Display_Init();
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
 
 
   /* USER CODE END 2 */
@@ -388,69 +367,31 @@ Error_Handler();
 
   int16_t last_encoder_cnt = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
 
-  // 刷出主菜单第一帧
-  Oscilloscope_Stop();
+  // Keep the initial ADC capture running for the Home live preview.
   Play_Cyber_Boot_Sequence();
-  Draw_Main_Menu();
-  if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) SCB_CleanDCache_by_Addr((uint32_t*)0x24020000, 800 * 480);
+  global_needs_redraw = 1U;
 
   while (1)
   {
+      Poll_Touch_Input();
       // =========================================================
-      // 进阶版：编码器按键 (PE1, 短按切换焦点，长按重置波形)
+      // 编码器按键 (PE1)：无短按/长按复用，松开后只执行一次复位。
       // =========================================================
       static uint8_t encoder_btn_last = 1;
-      static uint32_t btn_press_time = 0;      // 记录按下的时刻
-      static uint8_t long_press_triggered = 0; // 长按触发标志位
+      static uint32_t btn_press_time = 0;
 
       uint8_t encoder_btn_now = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_1);
 
       // 只要处于低电平，就锁定旋钮防误触
       uint8_t is_button_pressing = (encoder_btn_now == GPIO_PIN_RESET);
 
-      // 1. 按下瞬间：记录时间，清除长按标记
       if (encoder_btn_last == 1 && encoder_btn_now == 0) {
           btn_press_time = HAL_GetTick();
-          long_press_triggered = 0;
       }
 
-      // 2. 按住过程：检测是否触发长按 (阈值设为 800ms)
-      if (encoder_btn_now == 0 && !long_press_triggered) {
-          if (HAL_GetTick() - btn_press_time > 800) {
-              long_press_triggered = 1; // 标记已触发长按，防止重复触发
-
-              // 💥 执行重置波形参数逻辑！
-              if (current_sys_state == SYS_OSC) {
-                  Oscilloscope_ResetControls();
-                  global_needs_redraw = 1;
-              }
-              else if (current_sys_state == SYS_GEN) {
-                  wg_freq = 1000.0f;
-                  wg_amp = 3.3f;
-                  UART_SendToF103("F:%d\n", (int)wg_freq); // 同步数码管
-                  UART_SendToF103("A:3.3\n");
-
-                  Sync_Hardware_WaveGen(); // 💥 长按复位，同步底层 DAC！
-
-                  global_needs_redraw = 1;
-              }
-          }
-      }
-
-      // 3. 松开瞬间：如果没有触发长按，且经过了 20ms 的消抖，则视为【短按】
       if (encoder_btn_last == 0 && encoder_btn_now == 1) {
-          if (!long_press_triggered && (HAL_GetTick() - btn_press_time > 20)) {
-
-              // 💥 执行短按切换焦点逻辑
-              if (current_sys_state == SYS_OSC) {
-                  UART_SendToF103("I:\n"); // 打断 F103 跑马灯
-                  if (current_ctrl < 3) current_ctrl++; else current_ctrl = 0;
-                  global_needs_redraw = 1;
-              }
-              else if (current_sys_state == SYS_GEN) {
-                  wg_ctrl = !wg_ctrl; // 频率和幅值焦点切换
-                  global_needs_redraw = 1;
-              }
+          if (HAL_GetTick() - btn_press_time >= 20U) {
+              Reset_Current_Mode();
           }
       }
 
@@ -469,11 +410,24 @@ Error_Handler();
               if (current_sys_state == SYS_OSC) {
                   UART_SendToF103("I:\n"); // 打断 F103 跑马灯
                   int16_t step = diff > 0 ? 1 : -1;
+                  bool fine = Oscilloscope_GetState()->fine_adjustment;
                   switch (current_ctrl) {
-                      case CTRL_TIMEBASE:      Oscilloscope_AdjustTimebase(step); break;
-                      case CTRL_VOLTS_DIV:     Oscilloscope_AdjustVoltsPerDiv(step); break;
-                      case CTRL_TRIGGER_LEVEL: Oscilloscope_AdjustTrigger(-step); break;
-                      case CTRL_VERTICAL_POS:  Oscilloscope_AdjustVerticalPosition(-step); break;
+                      case CTRL_TIMEBASE:
+                          if (fine) Oscilloscope_AdjustTimebaseFine(step);
+                          else Oscilloscope_AdjustTimebase(step);
+                          break;
+                      case CTRL_VOLTS_DIV:
+                          if (fine) Oscilloscope_AdjustVoltsPerDivFine(step);
+                          else Oscilloscope_AdjustVoltsPerDiv(step);
+                          break;
+                      case CTRL_TRIGGER_LEVEL:
+                          if (fine) Oscilloscope_AdjustTriggerFine(-step);
+                          else Oscilloscope_AdjustTrigger(-step);
+                          break;
+                      case CTRL_VERTICAL_POS:
+                          if (fine) Oscilloscope_AdjustVerticalPositionFine(-step);
+                          else Oscilloscope_AdjustVerticalPosition(-step);
+                          break;
                   }
                   global_needs_redraw = 1;
               }
@@ -517,35 +471,22 @@ Error_Handler();
       // =========================================================
       // 统一渲染调度 (被触摸、手势或编码器触发)
       // =========================================================
-      static uint32_t last_scope_render = 0U;
-      if (Oscilloscope_Poll() && current_sys_state == SYS_OSC &&
-          (HAL_GetTick() - last_scope_render >= 33U)) {
-          last_scope_render = HAL_GetTick();
+      static uint32_t last_render = 0U;
+      if (Oscilloscope_Poll() && current_sys_state != SYS_GEN) {
           global_needs_redraw = 1U;
       }
+      uint32_t now = HAL_GetTick();
+      if (UI_Tick(now)) global_needs_redraw = 1U;
 
-      if (global_needs_redraw) {
+      if (global_needs_redraw && now - last_render >= 33U && Display_BeginFrame()) {
+          last_render = now;
           global_needs_redraw = 0; // 清除标志
+          UI_Render();
 
-          if (current_sys_state == SYS_MAIN_MENU) {
-              UART_SendToF103("I:\n"); // 主菜单默认让 F103 亮起 UESTC 跑马灯
-              Draw_Main_Menu();
-          }
-          else if (current_sys_state == SYS_OSC) {
-              Draw_Oscilloscope_UI();
-              Draw_Waveform();
-          }
-          else if (current_sys_state == SYS_GEN) {
-              Draw_WaveGen_UI();
-          }
-
-          // 刷入显存 (M7 必备的 D-Cache 清理操作)
-          if ((SCB->CCR & SCB_CCR_DC_Msk) != 0U) {
-              SCB_CleanDCache_by_Addr((uint32_t*)0x24020000, 800 * 480);
-          }
+          Display_Present();
       }
 
-      HAL_Delay(10); // 彻底释放 CPU 资源，留给中断处理触摸和串口
+      HAL_Delay(1); // 动效按时间推进，输入处理不等待动效结束。
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -708,8 +649,6 @@ static void MX_LTDC_Init(void)
 
   /* USER CODE END LTDC_Init 0 */
 
-  LTDC_LayerCfgTypeDef pLayerCfg = {0};
-
   /* USER CODE BEGIN LTDC_Init 1 */
 
   /* USER CODE END LTDC_Init 1 */
@@ -733,25 +672,7 @@ static void MX_LTDC_Init(void)
   {
     Error_Handler();
   }
-  pLayerCfg.WindowX0 = 0;
-  pLayerCfg.WindowX1 = 800;
-  pLayerCfg.WindowY0 = 0;
-  pLayerCfg.WindowY1 = 480;
-  pLayerCfg.PixelFormat = LTDC_PIXEL_FORMAT_L8;
-  pLayerCfg.Alpha = 255;
-  pLayerCfg.Alpha0 = 0;
-  pLayerCfg.BlendingFactor1 = LTDC_BLENDING_FACTOR1_CA;
-  pLayerCfg.BlendingFactor2 = LTDC_BLENDING_FACTOR2_CA;
-  pLayerCfg.FBStartAdress = 0x24020000;
-  pLayerCfg.ImageWidth = 800;
-  pLayerCfg.ImageHeight = 480;
-  pLayerCfg.Backcolor.Blue = 0;
-  pLayerCfg.Backcolor.Green = 0;
-  pLayerCfg.Backcolor.Red = 0;
-  if (HAL_LTDC_ConfigLayer(&hltdc, &pLayerCfg, 0) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /* Display_Init configures scanout after its first frame is ready. */
   /* USER CODE BEGIN LTDC_Init 2 */
 
   /* USER CODE END LTDC_Init 2 */
@@ -1003,32 +924,91 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
-        if (h7_rx_byte == '\n') {
-            h7_cmd_buf[h7_cmd_idx] = '\0';
-
-            // 👆 解析来自 F103 的单指触摸数据 (T:X,Y)
-            if (h7_cmd_buf[0] == 'T' && h7_cmd_buf[1] == ':') {
-                int tx = 0, ty = 0;
-                if (sscanf(h7_cmd_buf, "T:%d,%d", &tx, &ty) == 2) {
-                    Process_Touch_Interaction((uint16_t)tx, (uint16_t)ty);
-                }
-            }
-            // ✌️ 💥新增：解析来自 F103 的双指捏合数据 (M:X1,Y1,X2,Y2)
-            else if (h7_cmd_buf[0] == 'M' && h7_cmd_buf[1] == ':') {
-                int x1, y1, x2, y2;
-                if (sscanf(h7_cmd_buf, "M:%d,%d,%d,%d", &x1, &y1, &x2, &y2) == 4) {
-                    // 将提取出的 4 个坐标喂给双指缩放引擎
-                    Process_Pinch_Gesture((uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2);
-                }
-            }
-
-            h7_cmd_idx = 0; // 解析完清零缓冲索引
+        uint16_t next = (touch_head + 1U) & 255U;
+        if (next != touch_tail) {
+            touch_rx[touch_head] = h7_rx_byte;
+            __DMB();
+            touch_head = next;
         } else {
-            if (h7_cmd_idx < 30) h7_cmd_buf[h7_cmd_idx++] = h7_rx_byte;
+            touch_overflow = 1U;
         }
-
-        // 重新开启中断接收下一个字节
+        // ISR only receives bytes. Parsing, drawing and ADC/DAC changes run in main.
         HAL_UART_Receive_IT(&huart1, &h7_rx_byte, 1);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        touch_overflow = 1U;
+        HAL_UART_Receive_IT(&huart1, &h7_rx_byte, 1);
+    }
+}
+
+static void Poll_Touch_Input(void) {
+    static char command[32];
+    static uint8_t length, discard;
+    if (touch_overflow) {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        touch_tail = touch_head;
+        touch_overflow = 0U;
+        __set_PRIMASK(primask);
+        length = 0U;
+        discard = 1U;
+        is_pinching = 0U;
+        UI_OutputTouchCancel(HAL_GetTick());
+        global_needs_redraw = 1U;
+    }
+    // Bound each pass so malformed/continuous input cannot starve acquisition.
+    for (unsigned budget = 0; budget < 256U && touch_tail != touch_head; ++budget) {
+        __DMB();
+        uint8_t byte = touch_rx[touch_tail];
+        __DMB();
+        touch_tail = (touch_tail + 1U) & 255U;
+        if (byte == '\r') continue;
+        if (byte != '\n') {
+            if (!discard && length < sizeof(command) - 1U) command[length++] = byte;
+            else discard = 1U;
+            continue;
+        }
+        command[length] = '\0';
+        if (!discard) {
+            int x1, y1, x2, y2;
+            char extra;
+            if (sscanf(command, "T:%4d,%4d%c", &x1, &y1, &extra) == 2 &&
+                x1 >= 0 && x1 < 800 && y1 >= 0 && y1 < 480) {
+                Process_Touch_Interaction((uint16_t)x1, (uint16_t)y1);
+            } else if (sscanf(command, "D:%4d,%4d%c", &x1, &y1, &extra) == 2 &&
+                x1 >= 0 && x1 < 800 && y1 >= 0 && y1 < 480) {
+                if (UI_OutputTouchMove((uint16_t)x1, (uint16_t)y1, HAL_GetTick())) {
+                    global_needs_redraw = 1U;
+                }
+            } else if (sscanf(command, "M:%4d,%4d,%4d,%4d%c", &x1, &y1, &x2, &y2, &extra) == 4 &&
+                x1 >= 0 && x1 < 800 && y1 >= 0 && y1 < 480 &&
+                x2 >= 0 && x2 < 800 && y2 >= 0 && y2 < 480) {
+                UI_OutputTouchCancel(HAL_GetTick());
+                global_needs_redraw = 1U;
+                Process_Pinch_Gesture((uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2);
+            } else if (strcmp(command, "C:") == 0) {
+                UI_OutputTouchCancel(HAL_GetTick());
+                is_pinching = 0U;
+                global_needs_redraw = 1U;
+            } else if (strcmp(command, "U:") == 0) {
+                is_pinching = 0U;
+                if (UI_OutputTouchRelease(HAL_GetTick())) {
+                    DAC_WaveGen_SetEnabled(wg_enabled);
+                }
+                global_needs_redraw = 1U;
+            } else {
+                UI_OutputTouchCancel(HAL_GetTick());
+                global_needs_redraw = 1U;
+            }
+        } else {
+            UI_OutputTouchCancel(HAL_GetTick());
+            global_needs_redraw = 1U;
+        }
+        length = 0U;
+        discard = 0U;
     }
 }
 

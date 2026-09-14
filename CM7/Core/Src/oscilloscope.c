@@ -8,21 +8,19 @@ __attribute__((section(".dma_buffer"), aligned(32)))
 static uint16_t adc_dma_buffer[OSC_RAW_SAMPLES];
 
 static uint16_t trace_buffer[OSC_TRACE_POINTS];
+static uint16_t trace_count = OSC_TRACE_POINTS;
 static volatile bool dma_complete;
 static volatile bool dma_active;
 static volatile bool acquisition_error;
-static bool single_pending;
+volatile OscilloscopeDiagnostics osc_diagnostics;
 
 static const uint32_t timebase_table_us[] = {
-    50U, 100U, 200U, 500U, 1000U, 2000U, 5000U, 10000U
+    2U, 5U, 10U, 20U, 50U, 100U, 200U, 500U, 1000U, 2000U, 5000U, 10000U
 };
 
 static const float volts_per_div_table[] = {
     0.1f, 0.2f, 0.5f, 1.0f
 };
-
-static uint8_t timebase_index = 3U;
-static uint8_t volts_per_div_index = 2U;
 
 static OscilloscopeState state = {
     .sample_rate_hz = 120000U,
@@ -32,9 +30,12 @@ static OscilloscopeState state = {
     .vertical_center_v = 1.65f,
     .frequency_hz = 0.0f,
     .vpp_v = 0.0f,
+    .minimum_v = 0.0f,
+    .maximum_v = 0.0f,
     .average_v = 0.0f,
     .trigger_slope = OSC_TRIGGER_RISING,
     .running = false,
+    .single_active = false,
     .frame_valid = false
 };
 
@@ -91,14 +92,18 @@ static void begin_capture(void)
     prepare_dma_buffer();
     if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma_buffer,
                           OSC_RAW_SAMPLES) != HAL_OK) {
+        ++osc_diagnostics.start_errors;
         state.running = false;
+        state.single_active = false;
         return;
     }
 
     __HAL_TIM_SET_COUNTER(&htim2, 0U);
     if (HAL_TIM_Base_Start(&htim2) != HAL_OK) {
+        ++osc_diagnostics.start_errors;
         (void)HAL_ADC_Stop_DMA(&hadc1);
         state.running = false;
+        state.single_active = false;
         return;
     }
     dma_active = true;
@@ -115,7 +120,7 @@ static uint16_t find_trigger_start(void)
 {
     const uint16_t level = voltage_to_adc(state.trigger_level_v);
     const uint16_t hysteresis = 8U;
-    const uint16_t pretrigger = OSC_TRACE_POINTS / 4U;
+    const uint16_t pretrigger = trace_count / 4U;
     bool armed = false;
 
     for (uint16_t i = 32U; i < OSC_RAW_SAMPLES - 32U; ++i) {
@@ -133,14 +138,14 @@ static uint16_t find_trigger_start(void)
         if (triggered) {
             if (i <= pretrigger) return 0U;
             uint16_t start = i - pretrigger;
-            if ((uint32_t)start + OSC_TRACE_POINTS > OSC_RAW_SAMPLES) {
-                start = OSC_RAW_SAMPLES - OSC_TRACE_POINTS;
+            if ((uint32_t)start + trace_count > OSC_RAW_SAMPLES) {
+                start = OSC_RAW_SAMPLES - trace_count;
             }
             return start;
         }
     }
 
-    return (OSC_RAW_SAMPLES - OSC_TRACE_POINTS) / 2U;
+    return (OSC_RAW_SAMPLES - trace_count) / 2U;
 }
 
 static void calculate_measurements(void)
@@ -158,6 +163,8 @@ static void calculate_measurements(void)
 
     const float adc_to_volts = OSC_INPUT_FULL_V / (float)OSC_ADC_MAX;
     state.vpp_v = (float)(maximum - minimum) * adc_to_volts;
+    state.minimum_v = (float)minimum * adc_to_volts;
+    state.maximum_v = (float)maximum * adc_to_volts;
     state.average_v = ((float)sum / (float)OSC_RAW_SAMPLES) * adc_to_volts;
     state.frequency_hz = 0.0f;
 
@@ -199,8 +206,15 @@ static void process_frame(void)
     }
 
     calculate_measurements();
+    /* Keep real samples only. Fast timebases expand their actual timestamps
+     * across the plot; they do not claim 600 independent ADC measurements. */
+    uint64_t span = (uint64_t)state.sample_rate_hz * state.timebase_us_per_div * 10U;
+    uint32_t count = (uint32_t)((span + 999999U) / 1000000U);
+    if (count < 2U) count = 2U;
+    if (count > OSC_TRACE_POINTS) count = OSC_TRACE_POINTS;
+    trace_count = (uint16_t)count;
     const uint16_t start = find_trigger_start();
-    for (uint16_t i = 0U; i < OSC_TRACE_POINTS; ++i) {
+    for (uint16_t i = 0U; i < trace_count; ++i) {
         trace_buffer[i] = adc_dma_buffer[start + i];
     }
     state.frame_valid = true;
@@ -220,14 +234,14 @@ HAL_StatusTypeDef Oscilloscope_Init(void)
 void Oscilloscope_Start(void)
 {
     state.running = true;
-    single_pending = false;
+    state.single_active = false;
     begin_capture();
 }
 
 void Oscilloscope_Stop(void)
 {
     state.running = false;
-    single_pending = false;
+    state.single_active = false;
     acquisition_error = false;
     dma_complete = false;
     (void)HAL_TIM_Base_Stop(&htim2);
@@ -243,25 +257,26 @@ void Oscilloscope_ToggleRun(void)
 
 void Oscilloscope_Single(void)
 {
+    if (state.single_active) return;
     Oscilloscope_Stop();
-    single_pending = true;
+    state.single_active = true;
     state.running = true;
     begin_capture();
 }
 
 void Oscilloscope_ResetControls(void)
 {
-    const bool was_running = state.running;
+    const bool resume_continuous = state.running && !state.single_active;
     Oscilloscope_Stop();
-    timebase_index = 3U;
-    volts_per_div_index = 2U;
-    state.timebase_us_per_div = timebase_table_us[timebase_index];
-    state.volts_per_div = volts_per_div_table[volts_per_div_index];
+    state.timebase_us_per_div = 500U;
+    state.volts_per_div = 0.5f;
+    state.fine_adjustment = false;
     state.trigger_level_v = 1.65f;
     state.vertical_center_v = 1.65f;
     state.trigger_slope = OSC_TRIGGER_RISING;
+    state.frame_valid = false;
     configure_sample_timer();
-    if (was_running) Oscilloscope_Start();
+    if (resume_continuous) Oscilloscope_Start();
 }
 
 bool Oscilloscope_Poll(void)
@@ -278,9 +293,10 @@ bool Oscilloscope_Poll(void)
     dma_complete = false;
     (void)HAL_ADC_Stop_DMA(&hadc1);
     process_frame();
+    ++osc_diagnostics.completed_frames;
 
-    if (single_pending) {
-        single_pending = false;
+    if (state.single_active) {
+        state.single_active = false;
         state.running = false;
     }
     if (state.running) begin_capture();
@@ -301,34 +317,108 @@ void Oscilloscope_OnError(ADC_HandleTypeDef *hadc)
     (void)HAL_TIM_Base_Stop(&htim2);
     dma_active = false;
     acquisition_error = true;
+    ++osc_diagnostics.adc_errors;
 }
 
+static void set_timebase(uint32_t value)
+{
+    if (value == state.timebase_us_per_div) return;
+    const bool resume_continuous = state.running && !state.single_active;
+    Oscilloscope_Stop();
+    state.timebase_us_per_div = value;
+    /* Never relabel a held capture with a newly configured sampling clock. */
+    state.frame_valid = false;
+    configure_sample_timer();
+    if (resume_continuous) Oscilloscope_Start();
+}
+
+/* From a fine-adjusted value, coarse motion goes to the next standard
+ * setting in the requested direction, not a stale table index. */
 void Oscilloscope_AdjustTimebase(int steps)
 {
-    int next = (int)timebase_index + steps;
-    if (next < 0) next = 0;
-    if (next >= (int)(sizeof(timebase_table_us) / sizeof(timebase_table_us[0]))) {
-        next = (int)(sizeof(timebase_table_us) / sizeof(timebase_table_us[0])) - 1;
+    uint32_t value = state.timebase_us_per_div;
+    const int count = sizeof(timebase_table_us) / sizeof(timebase_table_us[0]);
+    if (steps > count) steps = count;
+    if (steps < -count) steps = -count;
+    while (steps > 0) {
+        for (int i = 0; i < count; ++i) {
+            if (timebase_table_us[i] > value) { value = timebase_table_us[i]; break; }
+        }
+        --steps;
     }
-    if (next == (int)timebase_index) return;
-
-    const bool was_running = state.running;
-    Oscilloscope_Stop();
-    timebase_index = (uint8_t)next;
-    state.timebase_us_per_div = timebase_table_us[timebase_index];
-    configure_sample_timer();
-    if (was_running) Oscilloscope_Start();
+    while (steps < 0) {
+        for (int i = count-1; i >= 0; --i) {
+            if (timebase_table_us[i] < value) { value = timebase_table_us[i]; break; }
+        }
+        ++steps;
+    }
+    set_timebase(value);
 }
 
 void Oscilloscope_AdjustVoltsPerDiv(int steps)
 {
-    int next = (int)volts_per_div_index + steps;
-    if (next < 0) next = 0;
-    if (next >= (int)(sizeof(volts_per_div_table) / sizeof(volts_per_div_table[0]))) {
-        next = (int)(sizeof(volts_per_div_table) / sizeof(volts_per_div_table[0])) - 1;
+    const int count = sizeof(volts_per_div_table) / sizeof(volts_per_div_table[0]);
+    if (steps > count) steps = count;
+    if (steps < -count) steps = -count;
+    while (steps > 0) {
+        for (int i = 0; i < count; ++i) {
+            if (volts_per_div_table[i] > state.volts_per_div + 0.001f) {
+                state.volts_per_div = volts_per_div_table[i]; break;
+            }
+        }
+        --steps;
     }
-    volts_per_div_index = (uint8_t)next;
-    state.volts_per_div = volts_per_div_table[volts_per_div_index];
+    while (steps < 0) {
+        for (int i = count-1; i >= 0; --i) {
+            if (volts_per_div_table[i] < state.volts_per_div - 0.001f) {
+                state.volts_per_div = volts_per_div_table[i]; break;
+            }
+        }
+        ++steps;
+    }
+}
+
+void Oscilloscope_SetFineAdjustment(bool fine) { state.fine_adjustment = fine; }
+
+static uint32_t fine_value(uint32_t value, uint32_t minimum, uint32_t maximum, int steps)
+{
+    if (steps > 128) steps = 128;
+    if (steps < -128) steps = -128;
+    while (steps != 0) {
+        uint32_t increment = (value + 5U) / 10U;
+        if (!increment) increment = 1U;
+        value = steps > 0 ? value + increment : value - increment;
+        if (value < minimum) value = minimum;
+        if (value > maximum) value = maximum;
+        steps += steps > 0 ? -1 : 1;
+    }
+    return value;
+}
+
+void Oscilloscope_AdjustTimebaseFine(int steps)
+{
+    set_timebase(fine_value(state.timebase_us_per_div, 2U, 10000U, steps));
+}
+
+void Oscilloscope_AdjustVoltsPerDivFine(int steps)
+{
+    uint32_t centivolts = (uint32_t)(state.volts_per_div * 100.0f + 0.5f);
+    state.volts_per_div = (float)fine_value(centivolts, 10U, 100U, steps) * 0.01f;
+}
+
+static float clamp_voltage(float v)
+{
+    return v < 0.0f ? 0.0f : v > OSC_INPUT_FULL_V ? OSC_INPUT_FULL_V : v;
+}
+
+void Oscilloscope_AdjustTriggerFine(int steps)
+{
+    state.trigger_level_v = clamp_voltage(state.trigger_level_v + (float)steps * 0.01f);
+}
+
+void Oscilloscope_AdjustVerticalPositionFine(int steps)
+{
+    state.vertical_center_v = clamp_voltage(state.vertical_center_v + (float)steps * 0.01f);
 }
 
 void Oscilloscope_AdjustTrigger(int steps)
@@ -361,6 +451,6 @@ const OscilloscopeState *Oscilloscope_GetState(void)
 
 const uint16_t *Oscilloscope_GetTrace(uint16_t *point_count)
 {
-    if (point_count != NULL) *point_count = OSC_TRACE_POINTS;
+    if (point_count != NULL) *point_count = trace_count;
     return trace_buffer;
 }

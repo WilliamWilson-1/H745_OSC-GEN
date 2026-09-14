@@ -41,7 +41,10 @@ MEMORY
 FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 1024K
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
 ITCMRAM (xrw)      : ORIGIN = 0x00000000, LENGTH = 64K
-D2RAM (xrw)     : ORIGIN = 0x30000000, LENGTH = 288K
+D2RAM (xrw)     : ORIGIN = 0x30004000, LENGTH = 16K
+LCD_FRONT (xrw) : ORIGIN = 0x24000000, LENGTH = 384000
+LCD_TOP (xrw)   : ORIGIN = 0x2405DC00, LENGTH = 140288
+LCD_BOTTOM (xrw): ORIGIN = 0x30008000, LENGTH = 256K
 }
 /* Highest address of the user mode stack */
 _estack = 0x20020000;    /* end of RAM */
@@ -143,6 +146,19 @@ SECTIONS
   } >RAM AT> FLASH
 
   /* DMA1/DMA2 cannot access CM7 DTCM (0x20000000). */
+  .lcd_front (NOLOAD) : ALIGN(32)
+  {
+    KEEP(*(.lcd_front))
+  } >LCD_FRONT
+  .lcd_top (NOLOAD) : ALIGN(32)
+  {
+    KEEP(*(.lcd_top))
+  } >LCD_TOP
+  .lcd_bottom (NOLOAD) : ALIGN(32)
+  {
+    KEEP(*(.lcd_bottom))
+  } >LCD_BOTTOM
+
   .dma_buffer (NOLOAD) :
   {
     . = ALIGN(32);

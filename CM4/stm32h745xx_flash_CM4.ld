@@ -39,10 +39,11 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 FLASH (rx)      : ORIGIN = 0x08100000, LENGTH = 1024K
-RAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 288K
+/* CM4's D2 alias. Upper D2 SRAM belongs to CM7 DMA and LCD buffers. */
+RAM (xrw)      : ORIGIN = 0x10000000, LENGTH = 16K
 }
 /* Highest address of the user mode stack */
-_estack = 0x10048000;    /* end of RAM */
+_estack = ORIGIN(RAM) + LENGTH(RAM);
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
