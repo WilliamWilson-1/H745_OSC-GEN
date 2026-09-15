@@ -129,7 +129,7 @@ static void Poll_Touch_Input(void);
 
 static void Reset_Current_Mode(void) {
     UI_OutputTouchCancel(HAL_GetTick());
-    if (current_sys_state == SYS_MAIN_MENU) return;
+    if (current_sys_state != SYS_OSC && current_sys_state != SYS_GEN) return;
     if (current_sys_state == SYS_OSC) {
         Oscilloscope_ResetControls();
         current_ctrl = CTRL_TIMEBASE;
@@ -196,6 +196,10 @@ void Process_Touch_Interaction(uint16_t x, uint16_t y) {
     case UI_FREQUENCY: wg_ctrl = 0U; break;
     case UI_AMPLITUDE: wg_ctrl = 1U; break;
     case UI_MOTION: UI_ToggleMotion(); break;
+    case UI_ABOUT: current_sys_state = SYS_ABOUT; break;
+    case UI_THEME_DARK: UI_SelectTheme(UI_THEME_GRAPHITE); break;
+    case UI_THEME_BLUE: UI_SelectTheme(UI_THEME_MIDNIGHT); break;
+    case UI_THEME_LIGHT: UI_SelectTheme(UI_THEME_IVORY); break;
     default: break;
     }
     global_needs_redraw = 1U;
@@ -472,7 +476,7 @@ Error_Handler();
       // 统一渲染调度 (被触摸、手势或编码器触发)
       // =========================================================
       static uint32_t last_render = 0U;
-      if (Oscilloscope_Poll() && current_sys_state != SYS_GEN) {
+      if (Oscilloscope_Poll() && (current_sys_state == SYS_OSC || current_sys_state == SYS_MAIN_MENU)) {
           global_needs_redraw = 1U;
       }
       uint32_t now = HAL_GetTick();

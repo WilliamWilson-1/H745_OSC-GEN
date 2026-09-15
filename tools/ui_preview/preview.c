@@ -60,12 +60,13 @@ static void snapshot(const char *name) {
 }
 static bool enabled(SystemState s, UiAction a) {
     return (s!=SYS_MAIN_MENU && a==UI_HOME) ||
-        (s==SYS_MAIN_MENU && (a==UI_OSC||a==UI_GEN||a==UI_MOTION)) ||
+        (s==SYS_MAIN_MENU && (a==UI_OSC||a==UI_GEN||a==UI_MOTION||a==UI_ABOUT)) ||
         (s==SYS_OSC && a>=UI_TIME && a<=UI_FINE) ||
-        (s==SYS_GEN && a>=UI_SINE && a<=UI_AMPLITUDE);
+        (s==SYS_GEN && a>=UI_SINE && a<=UI_AMPLITUDE) ||
+        (s==SYS_ABOUT && a>=UI_THEME_DARK && a<=UI_THEME_LIGHT);
 }
 static void test_hitboxes(void) {
-    for(SystemState s=SYS_MAIN_MENU;s<=SYS_GEN;++s) {
+    for(SystemState s=SYS_MAIN_MENU;s<=SYS_ABOUT;++s) {
         for(int y=0;y<480;++y) for(int x=0;x<800;++x) {
             UiAction expected=UI_NONE;
             for(UiAction a=UI_HOME;a<UI_ACTION_COUNT;++a) {
@@ -138,6 +139,60 @@ static void test_output_gestures(void) {
     render(9934); assert(!UI_Tick(9935));
     UI_ToggleMotion();
     puts("PASS: switch tap/drag, release-only commit, card exclusion, jitter, dead band, capture, cancellation, duplicate release and reduced motion.");
+}
+
+static double luminance(uint32_t rgb) {
+    double value=0;
+    const double weight[3]={0.0722,0.7152,0.2126};
+    for(unsigned i=0;i<3;++i) {
+        double c=(double)((rgb>>(i*8))&255)/255;
+        value+=weight[i]*(c<=0.04045?c/12.92:pow((c+0.055)/1.055,2.4));
+    }
+    return value;
+}
+static void test_about_themes(void) {
+    assert(UI_HitTest(SYS_MAIN_MENU,710,45)==UI_ABOUT);
+    assert(UI_HitTest(SYS_ABOUT,710,25)==UI_HOME);
+    assert(UI_HitTest(SYS_ABOUT,100,400)==UI_THEME_DARK);
+    assert(UI_HitTest(SYS_ABOUT,350,400)==UI_THEME_BLUE);
+    assert(UI_HitTest(SYS_ABOUT,600,400)==UI_THEME_LIGHT);
+    uint32_t palette_before[256]; memcpy(palette_before,my_palette,sizeof(my_palette));
+    OscilloscopeState before=state;
+    uint8_t output=wg_enabled;
+    unsigned sequence=0;
+    for(UiTheme theme=UI_THEME_GRAPHITE;theme<UI_THEME_COUNT;++theme) {
+        UI_SelectTheme(theme); assert(UI_GetTheme()==theme);
+        for(SystemState screen=SYS_MAIN_MENU;screen<=SYS_ABOUT;++screen) {
+            current_sys_state=screen;
+            uint32_t now=12000+(sequence++)*1000;
+            render(now); render(now+600);
+            char name[40]; snprintf(name,sizeof(name),"theme_%u_page_%u",theme,screen);
+            snapshot(name);
+        }
+        /* Normal text and selected labels retain readable contrast. */
+        const unsigned pairs[][2]={{4,0},{4,8},{10,0},{10,8},{3,11},{2,13}};
+        for(unsigned p=0;p<sizeof(pairs)/sizeof(pairs[0]);++p) {
+            double a=luminance(my_palette[theme*16+pairs[p][0]]);
+            double b=luminance(my_palette[theme*16+pairs[p][1]]);
+            double contrast=a>b?(a+0.05)/(b+0.05):(b+0.05)/(a+0.05);
+            assert(contrast>=4.5);
+        }
+    }
+    assert(memcmp(palette_before,my_palette,sizeof(my_palette))==0);
+    assert(memcmp(&before,&state,sizeof(state))==0 && wg_enabled==output);
+    memcpy(saved,ui_preview_framebuffer,sizeof(saved));
+    UI_SelectTheme(UI_THEME_GRAPHITE);
+    /* Selecting cannot mutate an already-rendered/queued framebuffer. */
+    assert(memcmp(saved,ui_preview_framebuffer,sizeof(saved))==0);
+    UI_SelectTheme((UiTheme)99); assert(UI_GetTheme()==UI_THEME_GRAPHITE);
+    UI_SelectTheme((UiTheme)-1); assert(UI_GetTheme()==UI_THEME_GRAPHITE);
+    for(unsigned i=0;i<90;++i) {
+        UI_SelectTheme((UiTheme)(i%UI_THEME_COUNT));
+        render(25000+i*33);
+        assert(memcmp(palette_before,my_palette,sizeof(my_palette))==0);
+    }
+    UI_SelectTheme(UI_THEME_GRAPHITE);
+    puts("PASS: About navigation; 3 themes x 4 pages; text contrast >=4.5; immutable CLUT/queued pixels; no instrument state changes; 90 rapid theme switches.");
 }
 
 int main(void) {
@@ -223,6 +278,7 @@ int main(void) {
     UI_NotifyTouch(UI_OSC,UINT32_MAX-50U); render(UINT32_MAX-50U);
     assert(UI_Tick(100)); assert(!UI_Tick(101)); /* tick wraparound */
     test_output_gestures();
-    puts("PASS: split-buffer pixel equivalence and guards; 1,152,000 hit-test pixels, target bounds/non-overlap, animation settling, rapid reversal, reduced motion, toast expiry, tick wraparound.");
+    test_about_themes();
+    puts("PASS: split-buffer pixel equivalence and guards; 1,536,000 hit-test pixels, target bounds/non-overlap, animation settling, rapid reversal, reduced motion, toast expiry, tick wraparound.");
     return 0;
 }

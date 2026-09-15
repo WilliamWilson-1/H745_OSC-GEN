@@ -7,8 +7,14 @@
 typedef enum {
     SYS_MAIN_MENU = 0,
     SYS_OSC,
-    SYS_GEN
+    SYS_GEN,
+    SYS_ABOUT
 } SystemState;
+
+#define UI_VERSION "v3.2"
+typedef enum { UI_THEME_GRAPHITE, UI_THEME_MIDNIGHT, UI_THEME_IVORY, UI_THEME_COUNT } UiTheme;
+UiTheme UI_GetTheme(void);
+void UI_SelectTheme(UiTheme theme);
 
 typedef enum {
     WAVE_SINE = 0,
@@ -37,7 +43,8 @@ extern uint32_t my_palette[256];
 typedef enum {
     UI_NONE, UI_HOME, UI_OSC, UI_GEN, UI_TIME, UI_VOLTS, UI_TRIGGER,
     UI_POSITION, UI_RUN, UI_SLOPE, UI_SINGLE, UI_COARSE, UI_FINE, UI_SINE, UI_SQUARE,
-    UI_TRIANGLE, UI_OUTPUT, UI_FREQUENCY, UI_AMPLITUDE, UI_MOTION, UI_ACTION_COUNT
+    UI_TRIANGLE, UI_OUTPUT, UI_FREQUENCY, UI_AMPLITUDE, UI_MOTION,
+    UI_ABOUT, UI_THEME_DARK, UI_THEME_BLUE, UI_THEME_LIGHT, UI_ACTION_COUNT
 } UiAction;
 
 typedef struct { int16_t x, y, w, h; } UiRect;
@@ -61,6 +68,7 @@ void Draw_Grid_And_Axes(void);
 void Draw_UI_Button(uint16_t x, uint16_t y, uint8_t is_selected,
                     void (*DrawIcon)(uint16_t, uint16_t, uint8_t));
 void Draw_Main_Menu(void);
+void Draw_About(void);
 void Draw_Oscilloscope_UI(void);
 void Draw_Waveform(void);
 void Draw_WaveGen_UI(void);

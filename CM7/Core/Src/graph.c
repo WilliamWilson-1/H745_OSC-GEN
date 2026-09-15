@@ -1,6 +1,7 @@
 #include "graph.h"
 #include "oscilloscope.h"
 #include "ui_font_data.h"
+#include "ui_logo_data.h"
 #include "display.h"
 #include <math.h>
 #include <stdio.h>
@@ -26,7 +27,19 @@ volatile uint8_t wg_ctrl = 0U;
 volatile uint8_t wg_enabled = 0U;
 volatile WaveType wg_wave = WAVE_SINE;
 uint32_t my_palette[256];
-static uint8_t text_blend[16][16][4];
+static uint8_t text_blend[UI_THEME_COUNT][16][16][4];
+static UiTheme current_theme = UI_THEME_GRAPHITE;
+
+UiTheme UI_GetTheme(void) { return current_theme; }
+void UI_SelectTheme(UiTheme theme)
+{
+    if ((unsigned)theme < UI_THEME_COUNT) current_theme = theme;
+}
+
+static uint8_t theme_color(uint8_t color)
+{
+    return color < 16U ? color + (uint8_t)current_theme * 16U : color;
+}
 
 /* One geometry source for both rendering and touch, including 48px targets. */
 static const UiRect rects[UI_ACTION_COUNT] = {
@@ -40,7 +53,9 @@ static const UiRect rects[UI_ACTION_COUNT] = {
     [UI_SINE] = {8, 72, 88, 56}, [UI_SQUARE] = {8, 136, 88, 56},
     [UI_TRIANGLE] = {8, 200, 88, 56}, [UI_OUTPUT] = {688, 381, 72, 48},
     [UI_FREQUENCY] = {112, 72, 328, 144}, [UI_AMPLITUDE] = {456, 72, 328, 144},
-    [UI_MOTION] = {584, 420, 184, 48}
+    [UI_MOTION] = {584, 420, 184, 48}, [UI_ABOUT] = {676, 24, 92, 48},
+    [UI_THEME_DARK] = {64, 376, 216, 60}, [UI_THEME_BLUE] = {292, 376, 216, 60},
+    [UI_THEME_LIGHT] = {520, 376, 216, 60}
 };
 
 static SystemState motion_screen = SYS_MAIN_MENU;
@@ -80,8 +95,8 @@ static uint8_t *row_pixels(unsigned y)
 static void clear_frame(void)
 {
     /* Only the back buffer is cleared. The visible frame remains untouched. */
-    memset(render_top, BG, DISPLAY_TOP_BYTES);
-    memset(render_bottom, BG, render_bottom_pitch*(SCREEN_H-DISPLAY_SPLIT_Y));
+    memset(render_top, theme_color(BG), DISPLAY_TOP_BYTES);
+    memset(render_bottom, theme_color(BG), render_bottom_pitch*(SCREEN_H-DISPLAY_SPLIT_Y));
 }
 
 static uint32_t mix_rgb(uint32_t a, uint32_t b, unsigned t, unsigned total)
@@ -97,25 +112,43 @@ static uint32_t mix_rgb(uint32_t a, uint32_t b, unsigned t, unsigned total)
 
 void UI_InitPalette(void)
 {
-    static const uint32_t base[16] = {
+    static const uint32_t themes[UI_THEME_COUNT][16] = {{
         0xff101419, 0xfff18b85, 0xff80dbb0, 0xff88baff,
         0xffedf1f5, 0xffeed28e, 0xff232e38, 0xff8fd4df,
         0xff1a2028, 0xff35414e, 0xffa0acba, 0xff283b50,
         0xff29323e, 0xff22392f, 0xff121920, 0xff607284
-    };
-    memcpy(my_palette, base, sizeof(base));
-    /* 240 additional shades keep small type antialiased in the L8 buffer. */
-    for (unsigned bg = 0; bg < 16; ++bg)
-        for (unsigned t = 1; t <= 15; ++t)
-            my_palette[16 + bg*15 + t-1] = mix_rgb(base[bg], base[WHITE], t, 16);
+    }, {
+        0xff0c1726, 0xfff18b85, 0xff77d6ba, 0xffa7c5ff,
+        0xffe9f1ff, 0xffeed28e, 0xff253a51, 0xff91d8ec,
+        0xff142338, 0xff38536e, 0xffa6b8ce, 0xff253d5e,
+        0xff263b54, 0xff193e38, 0xff0f1c2d, 0xff6987a5
+    }, {
+        0xfff3f1eb, 0xffa13532, 0xff176547, 0xff285cac,
+        0xff232b35, 0xff815709, 0xffdedfdc, 0xff236577,
+        0xfffaf9f5, 0xffa6aeb2, 0xff58626c, 0xffe0e8f3,
+        0xffe7ebef, 0xffe2eee5, 0xfffdfcf8, 0xff7b8893
+    }};
+    /* All themes share ONE immutable hardware CLUT. Frames contain their
+     * own theme indices, so a queued old frame cannot acquire new colors. */
+    memcpy(my_palette, themes, sizeof(themes));
+    static const unsigned surfaces[4] = {BG, PANEL, SELECTED, PLOT};
+    for (unsigned theme = 0; theme < UI_THEME_COUNT; ++theme)
+        for (unsigned surface = 0; surface < 4; ++surface)
+            for (unsigned t = 1; t <= 16; ++t)
+                my_palette[48 + theme*64 + surface*16 + t-1] =
+                    mix_rgb(themes[theme][surfaces[surface]],themes[theme][WHITE],t,17);
+    for (unsigned i = 240; i < 256; ++i) my_palette[i] = themes[0][i-240];
+    for (unsigned theme = 0; theme < UI_THEME_COUNT; ++theme) {
+    const uint32_t *base = themes[theme];
     for (unsigned fg = 0; fg < 16; ++fg) {
         for (unsigned bg = 0; bg < 16; ++bg) {
-            text_blend[fg][bg][0] = bg;
-            text_blend[fg][bg][3] = fg;
+            text_blend[theme][fg][bg][0] = bg;
+            text_blend[theme][fg][bg][3] = fg;
             for (unsigned a = 1; a < 3; ++a) {
                 uint32_t color = mix_rgb(base[bg], base[fg], a, 3);
                 unsigned best = 0, distance = 0xffffffffU;
                 for (unsigned p = 0; p < 256; ++p) {
+                    if (p < 48 && (p < theme*16 || p >= (theme+1)*16)) continue;
                     unsigned d = 0;
                     for (unsigned s = 0; s <= 16; s += 8) {
                         int delta = (int)((color >> s)&255) - (int)((my_palette[p] >> s)&255);
@@ -123,14 +156,16 @@ void UI_InitPalette(void)
                     }
                     if (d < distance) { distance = d; best = p; }
                 }
-                text_blend[fg][bg][a] = (uint8_t)best;
+                text_blend[theme][fg][bg][a] = (uint8_t)best;
             }
         }
+    }
     }
 }
 
 static void fill(int x, int y, int w, int h, uint8_t color)
 {
+    color = theme_color(color);
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x+w > SCREEN_W) w = SCREEN_W-x;
@@ -159,6 +194,7 @@ static void panel(UiRect r, uint8_t bg, uint8_t edge)
 
 void Draw_Line_L8(int x1, int y1, int x2, int y2, uint8_t color)
 {
+    color = theme_color(color);
     int dx=abs(x2-x1), sx=x1<x2?1:-1;
     int dy=-abs(y2-y1), sy=y1<y2?1:-1, error=dx+dy;
     for (;;) {
@@ -192,7 +228,7 @@ static void text_at(int x, int y, const char *text, uint8_t fg, uint8_t bg, unsi
             for (unsigned col=0; col<g->width; ++col) {
                 unsigned index=row*g->width+col;
                 uint8_t coverage=(ui_font_pixels[g->offset+index/4] >> ((index%4)*2))&3;
-                if (coverage) fill(x+(int)col,y+(int)row,1,1,text_blend[fg][bg][coverage]);
+                if (coverage) fill(x+(int)col,y+(int)row,1,1,text_blend[current_theme][fg][bg][coverage]);
             }
         }
         x+=g->advance;
@@ -230,9 +266,10 @@ UiAction UI_HitTest(SystemState screen, uint16_t x, uint16_t y)
     if (x>=SCREEN_W || y>=SCREEN_H) return UI_NONE;
     for (UiAction a=UI_HOME; a<UI_ACTION_COUNT; ++a) {
         bool enabled=(screen!=SYS_MAIN_MENU && a==UI_HOME) ||
-            (screen==SYS_MAIN_MENU && (a==UI_OSC || a==UI_GEN || a==UI_MOTION)) ||
+            (screen==SYS_MAIN_MENU && (a==UI_OSC || a==UI_GEN || a==UI_MOTION || a==UI_ABOUT)) ||
             (screen==SYS_OSC && a>=UI_TIME && a<=UI_FINE) ||
-            (screen==SYS_GEN && a>=UI_SINE && a<=UI_AMPLITUDE);
+            (screen==SYS_GEN && a>=UI_SINE && a<=UI_AMPLITUDE) ||
+            (screen==SYS_ABOUT && a>=UI_THEME_DARK && a<=UI_THEME_LIGHT);
         if (enabled && contains(rects[a],x,y)) return a;
     }
     return UI_NONE;
@@ -446,7 +483,8 @@ void Draw_Main_Menu(void)
 {
     clear_frame();
     text_at(32,24,"OSC / GEN",WHITE,BG,NUMBER);
-    text_at(34,78,"A small bench. Two precise tools.",MUTED,BG,BODY);
+    text_at(34,78,"Based on STM32H7",MUTED,BG,BODY);
+    button(UI_ABOUT,"About",false,WHITE);
     UiRect l=visual_rect(UI_OSC), r=visual_rect(UI_GEN);
     panel(l,PANEL,BORDER); panel(r,PANEL,BORDER);
     const OscilloscopeState *s=Oscilloscope_GetState();
@@ -471,6 +509,50 @@ void Draw_Main_Menu(void)
     text_at(r.x+24,r.y+234,"Set up output  >",BLUE,PANEL,SMALL);
     text_at(32,437,wg_enabled?"PA5 output is ON":"PA5 output is OFF",wg_enabled?GREEN:MUTED,BG,BODY);
     button(UI_MOTION,motion_enabled?"Motion: on":"Motion: reduced",false,MUTED);
+}
+
+static void centered_text(int center, int y, const char *label, uint8_t fg, uint8_t bg, unsigned font)
+{
+    text_at(center-text_width(label,font)/2,y,label,fg,bg,font);
+}
+
+void Draw_About(void)
+{
+    clear_frame();
+    topbar("About", NULL, BLUE);
+    /* Coverage, rather than a baked background, keeps the original logo
+     * crisp and correctly tinted on all themes. Data remains in Flash. */
+    for (unsigned y=0;y<UI_LOGO_HEIGHT;++y) {
+        for (unsigned x=0;x<UI_LOGO_WIDTH;++x) {
+            unsigned index=y*UI_LOGO_WIDTH+x;
+            unsigned coverage=(ui_logo_coverage[index/4]>>((index%4)*2))&3U;
+            if (coverage) fill(240+(int)x,88+(int)y,1,1,
+                              text_blend[current_theme][WHITE][BG][coverage]);
+        }
+    }
+    centered_text(400,206,"DEVELOPED BY",MUTED,BG,SMALL);
+    centered_text(400,230,"William Wilson   /   Vida David   /   Dkkk",WHITE,BG,BODY);
+    rounded(362,275,76,30,15,SELECTED);
+    centered_text(400,280,UI_VERSION,BLUE,SELECTED,SMALL);
+    fill(64,328,672,1,BORDER);
+    text_at(64,340,"Appearance",WHITE,BG,BODY);
+    text_at(502,344,"Choose your instrument's palette",MUTED,BG,SMALL);
+    static const char *names[UI_THEME_COUNT]={"Graphite","Midnight","Ivory"};
+    for (unsigned i=0;i<UI_THEME_COUNT;++i) {
+        UiAction action=(UiAction)(UI_THEME_DARK+i);
+        bool selected=current_theme==(UiTheme)i;
+        UiRect r=visual_rect(action);
+        uint8_t bg=selected?SELECTED:PANEL;
+        panel(r,bg,selected?BLUE:BORDER);
+        /* Direct palette indices >=48 are invariant, including swatches. */
+        rounded(r.x+16,r.y+17,26,26,13,(uint8_t)(48+i*64));
+        text_at(r.x+54,r.y+18,names[i],selected?BLUE:WHITE,bg,BODY);
+        if (selected) {
+            Draw_Line_L8(r.x+r.w-29,r.y+30,r.x+r.w-25,r.y+34,BLUE);
+            Draw_Line_L8(r.x+r.w-25,r.y+34,r.x+r.w-17,r.y+24,BLUE);
+        }
+    }
+    centered_text(400,450,"Applies to every page. Kept until restart.",MUTED,BG,SMALL);
 }
 
 void Draw_Grid_And_Axes(void)
@@ -594,7 +676,8 @@ void Draw_WaveGen_UI(void)
     text_at(r.x+20,r.y+43,wg_enabled?"PA5 waveform active":"Tap or slide the switch",MUTED,bg,SMALL);
     if(output_captured) rounded(684,385,80,40,20,BLUE);
     rounded(r.x+r.w-96,r.y+21,72,32,16,wg_enabled?GREEN:BORDER);
-    rounded(r.x+r.w-92+(int)(toggle_position*40.0f),r.y+25,24,24,12,WHITE);
+    rounded(r.x+r.w-92+(int)(toggle_position*40.0f),r.y+25,24,24,12,
+            current_theme==UI_THEME_IVORY?PANEL:WHITE);
     text_at(114,450,"Press knob to reset parameters and turn output off.",MUTED,BG,SMALL);
 }
 
@@ -602,6 +685,7 @@ void UI_Render(void)
 {
     if(current_sys_state==SYS_OSC) { Draw_Oscilloscope_UI(); Draw_Waveform(); }
     else if(current_sys_state==SYS_GEN) Draw_WaveGen_UI();
+    else if(current_sys_state==SYS_ABOUT) Draw_About();
     else Draw_Main_Menu();
     if(reset_visible) {
         /* Fixed, short acknowledgement; never delays input or acquisition. */
